@@ -320,8 +320,8 @@ td.strong { font-weight: 700; }
 
 /* ---------- Settings ---------- */
 .rate-input { width: 100px; text-align: right; background: var(--bg); border: 2px solid var(--border-strong); border-radius: var(--radius-sm); padding: 6px 8px; font-family: var(--font-mono); font-weight: 600; }
-.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-@media (max-width: 900px) { .settings-grid { grid-template-columns: 1fr; } }
+.settings-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 900px) { .settings-grid { grid-template-columns: minmax(0, 1fr); } }
 .max-scroll { max-height: 420px; overflow-y: auto; }
 
 /* ---------- Add material / product ---------- */
@@ -439,3 +439,7 @@ td.strong { font-weight: 700; }
 
 /* Anything marked hidden stays hidden, whatever its class sets display to. */
 [hidden] { display: none !important; }
+
+/* Keep wide tables scrolling inside their card instead of stretching the page on phones */
+.card, .field-row > *, .field { min-width: 0; }
+.table-wrap { max-width: 100%; }

@@ -45,6 +45,10 @@
     ebCost: 0, fuelCost: 0, maintenanceCost: 0, electricalMaintenanceCost: 0,
     stitchingExpense: 0, sackExpenses: 0, departmentExpenses: 0, staffSalaries: 0,
     budgetedMonthlyOutputMT: 0,
+    // Month-by-month breakdown — { "YYYY-MM": { ebCost, fuelCost, ..., budgetedMonthlyOutputMT, useActualOutput } }.
+    // When a batch's month has its own entry here, that month's figures are
+    // used for its processing cost instead of the single default breakdown.
+    months: {},
   };
   const PROCESSING_BREAKDOWN_FIELDS = [
     "ebCost", "fuelCost", "maintenanceCost", "electricalMaintenanceCost",
@@ -72,6 +76,85 @@
     const budgetMT = Number(labour.budgetedMonthlyOutputMT) || 0;
     if (budgetMT <= 0) return null;
     return monthlyProcessingCostTotal(labour) / budgetMT;
+  }
+
+  // ---------------------------------------------------------------
+  // Monthly processing cost — each month can carry its own expenses
+  // (EB, fuel, maintenance, ...). That month's ₹/MT rate is its total
+  // expenses divided by either the MT actually logged in the Batch Book
+  // that month (default) or a budgeted MT figure, and every batch dated
+  // in that month gets rate × its own MT output.
+  // ---------------------------------------------------------------
+  function monthKeyOf(date) { return date ? String(date).slice(0, 7) : ""; }
+
+  function monthBreakdown(month) {
+    const months = (state.labour && state.labour.months) || {};
+    return month && months[month] ? months[month] : null;
+  }
+
+  // Total MT logged in a month, counting only batches that use the
+  // breakdown rate (products with their own fixed processing cost are left out).
+  function actualOutputMTForMonth(month) {
+    return state.entries
+      .filter((e) => monthKeyOf(e.date) === month && productProcessingCostOverride(e.productId) == null)
+      .reduce((s, e) => s + (Number(e.outputQty) || 0), 0) / KG_PER_MT;
+  }
+
+  // Which MT figure divides the month's expenses, and where it came from.
+  function monthOutputBasis(mb, month) {
+    if (mb.useActualOutput !== false) {
+      const actual = actualOutputMTForMonth(month);
+      if (actual > 0) return { mt: actual, source: "actual" };
+    }
+    const budget = Number(mb.budgetedMonthlyOutputMT) || 0;
+    return { mt: budget, source: budget > 0 ? "budget" : "none" };
+  }
+
+  // ₹/MT for a given batch date: that month's own breakdown if it has one,
+  // otherwise the default breakdown, otherwise null (flat fallback).
+  function processingRateForDate(date) {
+    const month = monthKeyOf(date);
+    const mb = monthBreakdown(month);
+    if (mb) {
+      const basis = monthOutputBasis(mb, month);
+      if (basis.mt > 0) return monthlyProcessingCostTotal(mb) / basis.mt;
+    }
+    return processingCostPerMT(state.labour);
+  }
+
+  // Rewrites processingCost/totalCost/costPerKg (and jobworkProfit) on every
+  // batch in a month so stored figures follow that month's latest rate.
+  async function recomputeMonthProcessing(month) {
+    if (!month) return;
+    const rows = state.entries.filter((e) => monthKeyOf(e.date) === month && productProcessingCostOverride(e.productId) == null);
+    const rate = processingRateForDate(month + "-01");
+    const updates = [];
+    rows.forEach((e) => {
+      const proc = rate != null ? rate * ((Number(e.outputQty) || 0) / KG_PER_MT) : (Number(state.labour.processingCost) || 0);
+      if (Math.abs(proc - (Number(e.processingCost) || 0)) < 0.005) return;
+      const totalCost = (Number(e.rmCost) || 0) + proc + (Number(e.labourCost) || 0);
+      const fields = { processingCost: proc, totalCost, costPerKg: e.outputQty > 0 ? totalCost / e.outputQty : 0 };
+      if (e.jobworkCompanyId) fields.jobworkProfit = (Number(e.jobworkRevenue) || 0) - totalCost;
+      updates.push({ id: e.id, fields });
+    });
+    if (!updates.length) return 0;
+    updates.forEach((u) => {
+      const idx = state.entries.findIndex((e) => e.id === u.id);
+      if (idx !== -1) state.entries[idx] = Object.assign({}, state.entries[idx], u.fields);
+    });
+    if (state.db) {
+      for (let i = 0; i < updates.length; i += 400) {
+        const batch = state.db.batch();
+        updates.slice(i, i + 400).forEach((u) => {
+          if (!String(u.id).startsWith("local_")) batch.update(state.db.collection("entries").doc(u.id), u.fields);
+        });
+        await batch.commit();
+      }
+    } else {
+      renderTodayList();
+      renderReports();
+    }
+    return updates.length;
   }
 
   // Units offered everywhere a material or product's unit is picked.
@@ -259,7 +342,7 @@
     return Number(company.labourCost) || 0;
   }
 
-  function computeCosts(materialsQty, outputQty, operators, loadmen, productId, companyId) {
+  function computeCosts(materialsQty, outputQty, operators, loadmen, productId, companyId, date) {
     let rmCost = 0;
     state.materials.forEach((m) => {
       const q = Number(materialsQty[m.id]) || 0;
@@ -270,7 +353,7 @@
     if (override != null) {
       processingCost = override;
     } else {
-      const perMT = processingCostPerMT(state.labour);
+      const perMT = processingRateForDate(date);
       processingCost = perMT != null
         ? perMT * (outputQty / KG_PER_MT)
         : (Number(state.labour.processingCost) || 0);
@@ -759,13 +842,15 @@
       },
       () => {}
     );
-    db.collection("entries").orderBy("createdAt", "desc").limit(500).onSnapshot(
+    db.collection("entries").orderBy("createdAt", "desc").limit(3000).onSnapshot(
       (snap) => {
         state.entries = snap.docs.map((d) => Object.assign({ id: d.id }, d.data()));
         renderTodayList();
         renderReports();
         renderStock();
         renderJobPnL();
+        updateProcessingBreakdownReadout();
+        renderMonthlyProcessingHistory();
       },
       (e) => { toast("Sync error loading entries: " + e.message, "error"); }
     );
@@ -1120,7 +1205,8 @@
     const mats = getFormMaterialsQty();
     const productId = $("#f-product") ? $("#f-product").value : "";
     const companyId = $("#f-jobwork-company") ? $("#f-jobwork-company").value : "";
-    const c = computeCosts(mats, outputQty, operators, loadmen, productId, companyId);
+    const formDate = $("#f-date") ? $("#f-date").value : todayStr();
+    const c = computeCosts(mats, outputQty, operators, loadmen, productId, companyId, formDate);
     $("#sum-rm").textContent = fmtINR(c.rmCost);
     $("#sum-processing").textContent = fmtINR(c.processingCost);
     // With the shared day crew on (and no product/company labour
@@ -1242,7 +1328,7 @@
       const enteredRate = rateInp ? Number(rateInp.value) || 0 : 0;
       if (enteredRate <= 0) return toast("Enter the rate agreed for this order first.", "error");
     }
-    const c = computeCosts(mats, outputQty, operators, loadmen, productId, jobworkCompanyId);
+    const c = computeCosts(mats, outputQty, operators, loadmen, productId, jobworkCompanyId, date);
     const editingId = state.editingEntryId;
     const existing = editingId ? state.entries.find((e) => e.id === editingId) : null;
     const payload = {
@@ -1323,6 +1409,10 @@
         if (idx !== -1) state.entries[idx] = merged; else state.entries.unshift(merged);
       }
       if (useDayLabour) await saveDayLabour(date, dayOperators, dayLoadmen);
+      // This batch's output changes the month's actual MT (and so its ₹/MT
+      // rate) — re-cost the month first, then rebalance the day crew.
+      await recomputeMonthProcessing(monthKeyOf(date));
+      if (existing && existing.date && monthKeyOf(existing.date) !== monthKeyOf(date)) await recomputeMonthProcessing(monthKeyOf(existing.date));
       await recomputeDayLabourSplit(date);
       if (!state.db) {
         renderTodayList();
@@ -1619,9 +1709,11 @@
         // the rest. Drop it from our local copy first since the realtime
         // listener hasn't come back yet.
         state.entries = state.entries.filter((e) => e.id !== id);
+        if (date) await recomputeMonthProcessing(monthKeyOf(date));
         if (date) await recomputeDayLabourSplit(date);
       } else {
         state.entries = state.entries.filter((e) => e.id !== id);
+        if (date) await recomputeMonthProcessing(monthKeyOf(date));
         if (date) await recomputeDayLabourSplit(date);
         renderTodayList();
         renderReports();
@@ -2420,42 +2512,112 @@
     });
   }
 
+  const BREAKDOWN_INPUT_IDS = {
+    ebCost: "s-eb-cost", fuelCost: "s-fuel-cost", maintenanceCost: "s-maintenance-cost",
+    electricalMaintenanceCost: "s-electrical-maintenance-cost", stitchingExpense: "s-stitching-expense",
+    sackExpenses: "s-sack-expenses", departmentExpenses: "s-department-expenses", staffSalaries: "s-staff-salaries",
+  };
+
+  function selectedBreakdownMonth() {
+    const inp = $("#s-proc-month");
+    if (inp && !inp.value) inp.value = todayStr().slice(0, 7);
+    return inp ? inp.value : todayStr().slice(0, 7);
+  }
+
+  function prevMonthKey(month) {
+    const [y, m] = month.split("-").map(Number);
+    const d = new Date(y, m - 2, 1);
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+  }
+
+  function monthLabel(month) {
+    const [y, m] = month.split("-").map(Number);
+    return new Date(y, m - 1, 1).toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+  }
+
+  // Fills the breakdown boxes with the picked month's saved figures
+  // (blank if that month hasn't been entered yet).
+  function loadBreakdownMonth() {
+    const month = selectedBreakdownMonth();
+    const mb = monthBreakdown(month);
+    Object.keys(BREAKDOWN_INPUT_IDS).forEach((k) => {
+      const inp = $("#" + BREAKDOWN_INPUT_IDS[k]);
+      if (inp) inp.value = mb && mb[k] ? mb[k] : "";
+    });
+    if ($("#s-budgeted-output-mt")) $("#s-budgeted-output-mt").value = mb && mb.budgetedMonthlyOutputMT ? mb.budgetedMonthlyOutputMT : "";
+    if ($("#s-use-actual-output")) $("#s-use-actual-output").checked = !mb || mb.useActualOutput !== false;
+    if ($("#proc-month-status")) {
+      $("#proc-month-status").textContent = mb
+        ? "Saved figures for " + monthLabel(month) + "."
+        : "Nothing entered for " + monthLabel(month) + " yet — its batches use the default rate. Enter the figures, or copy last month's.";
+    }
+    updateProcessingBreakdownReadout();
+  }
+
+  function readBreakdownDraft() {
+    const draft = {};
+    Object.keys(BREAKDOWN_INPUT_IDS).forEach((k) => { draft[k] = parseFloat($("#" + BREAKDOWN_INPUT_IDS[k]).value) || 0; });
+    draft.budgetedMonthlyOutputMT = parseFloat($("#s-budgeted-output-mt").value) || 0;
+    draft.useActualOutput = $("#s-use-actual-output") ? $("#s-use-actual-output").checked : true;
+    return draft;
+  }
+
   function renderSettingsLabour() {
     if ($("#s-operator-rate")) $("#s-operator-rate").value = state.labour.operatorRate;
     if ($("#s-loadman-rate")) $("#s-loadman-rate").value = state.labour.loadmanRate;
     if ($("#s-processing-cost")) $("#s-processing-cost").value = state.labour.processingCost;
-    const fieldIds = {
-      ebCost: "s-eb-cost", fuelCost: "s-fuel-cost", maintenanceCost: "s-maintenance-cost",
-      electricalMaintenanceCost: "s-electrical-maintenance-cost", stitchingExpense: "s-stitching-expense",
-      sackExpenses: "s-sack-expenses", departmentExpenses: "s-department-expenses", staffSalaries: "s-staff-salaries",
-    };
-    Object.keys(fieldIds).forEach((k) => {
-      const inp = $("#" + fieldIds[k]);
-      if (inp) inp.value = state.labour[k] || "";
-    });
-    if ($("#s-budgeted-output-mt")) $("#s-budgeted-output-mt").value = state.labour.budgetedMonthlyOutputMT || "";
-    updateProcessingBreakdownReadout();
+    loadBreakdownMonth();
+    renderMonthlyProcessingHistory();
   }
 
   // Reads the breakdown fields live (before saving) and updates the
-  // "Monthly total" / "Rate applied per batch" readout under them.
+  // readout under them for the picked month.
   function updateProcessingBreakdownReadout() {
     const totalEl = $("#proc-monthly-total");
     const rateEl = $("#proc-per-mt-rate");
-    if (!totalEl || !rateEl) return;
-    const draft = {
-      ebCost: $("#s-eb-cost").value, fuelCost: $("#s-fuel-cost").value,
-      maintenanceCost: $("#s-maintenance-cost").value, electricalMaintenanceCost: $("#s-electrical-maintenance-cost").value,
-      stitchingExpense: $("#s-stitching-expense").value, sackExpenses: $("#s-sack-expenses").value,
-      departmentExpenses: $("#s-department-expenses").value, staffSalaries: $("#s-staff-salaries").value,
-      budgetedMonthlyOutputMT: $("#s-budgeted-output-mt").value,
-    };
+    if (!totalEl || !rateEl || !$("#s-eb-cost")) return;
+    const month = selectedBreakdownMonth();
+    const draft = readBreakdownDraft();
     const total = monthlyProcessingCostTotal(draft);
     totalEl.textContent = fmtINR(total);
-    const perMT = processingCostPerMT(draft);
-    rateEl.textContent = perMT != null
-      ? fmtINR(perMT) + " / MT"
-      : "Not set up — using fallback";
+    const actual = actualOutputMTForMonth(month);
+    if ($("#proc-actual-mt")) $("#proc-actual-mt").textContent = fmtNum(actual, 2) + " MT";
+    const basis = monthOutputBasis(draft, month);
+    rateEl.textContent = basis.mt > 0
+      ? fmtINR(total / basis.mt) + " / MT (" + (basis.source === "actual" ? "on actual output" : "on budgeted output") + ")"
+      : "Needs output — log batches this month or enter a budgeted MT";
+  }
+
+  // Month-by-month history table under the breakdown.
+  function renderMonthlyProcessingHistory() {
+    const body = $("#proc-history-body");
+    if (!body) return;
+    const months = (state.labour && state.labour.months) || {};
+    const keys = Object.keys(months).sort().reverse();
+    body.innerHTML = "";
+    if (!keys.length) {
+      body.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "muted" }, ["No months entered yet."])]));
+      return;
+    }
+    keys.forEach((k) => {
+      const mb = months[k];
+      const total = monthlyProcessingCostTotal(mb);
+      const basis = monthOutputBasis(mb, k);
+      const power = (Number(mb.ebCost) || 0) + (Number(mb.fuelCost) || 0);
+      const maint = (Number(mb.maintenanceCost) || 0) + (Number(mb.electricalMaintenanceCost) || 0);
+      const tr = el("tr", {}, [
+        el("td", {}, [monthLabel(k)]),
+        el("td", { class: "num" }, [fmtINR(power)]),
+        el("td", { class: "num" }, [fmtINR(maint)]),
+        el("td", { class: "num" }, [fmtINR(total - power - maint)]),
+        el("td", { class: "num" }, [fmtINR(total)]),
+        el("td", { class: "num" }, [basis.mt > 0 ? fmtNum(basis.mt, 2) + (basis.source === "budget" ? " (budget)" : "") : "—"]),
+        el("td", { class: "num" }, [basis.mt > 0 ? fmtINR(total / basis.mt) : "—"]),
+      ]);
+      tr.style.cursor = "pointer";
+      tr.addEventListener("click", () => { $("#s-proc-month").value = k; loadBreakdownMonth(); });
+      body.appendChild(tr);
+    });
   }
 
   async function saveMaterialRates() {
@@ -2494,35 +2656,52 @@
   }
 
   async function saveProcessingBreakdown() {
-    const payload = Object.assign({}, state.labour, {
-      ebCost: parseFloat($("#s-eb-cost").value) || 0,
-      fuelCost: parseFloat($("#s-fuel-cost").value) || 0,
-      maintenanceCost: parseFloat($("#s-maintenance-cost").value) || 0,
-      electricalMaintenanceCost: parseFloat($("#s-electrical-maintenance-cost").value) || 0,
-      stitchingExpense: parseFloat($("#s-stitching-expense").value) || 0,
-      sackExpenses: parseFloat($("#s-sack-expenses").value) || 0,
-      departmentExpenses: parseFloat($("#s-department-expenses").value) || 0,
-      staffSalaries: parseFloat($("#s-staff-salaries").value) || 0,
-      budgetedMonthlyOutputMT: parseFloat($("#s-budgeted-output-mt").value) || 0,
-    });
-    // Keep the "Fallback processing cost per batch" field in sync with the
-    // breakdown's computed ₹/MT rate, so the two never show conflicting
-    // numbers (per-batch cost is always calculated in MT via this rate —
-    // see processingCostPerMT/computeCosts — the fallback is just the
-    // number that's also stored/shown so nothing looks out of date).
-    const perMT = processingCostPerMT(payload);
-    if (perMT != null) {
-      payload.processingCost = Math.round(perMT * 100) / 100;
-      if ($("#s-processing-cost")) $("#s-processing-cost").value = payload.processingCost;
-    }
+    const month = selectedBreakdownMonth();
+    if (!month) return toast("Pick a month first.", "error");
+    const months = Object.assign({}, state.labour.months || {});
+    months[month] = Object.assign(readBreakdownDraft(), { updatedAt: new Date().toISOString() });
+    const payload = Object.assign({}, state.labour, { months });
     state.labour = payload;
     try {
       if (state.db) await state.db.doc("settings/labour").set(payload);
-      toast("Processing cost breakdown saved" + (perMT != null ? " — fallback field updated to " + fmtINR(payload.processingCost) + "/MT." : "."), "success");
-      updateProcessingBreakdownReadout();
+      const changed = await recomputeMonthProcessing(month);
+      const rate = processingRateForDate(month + "-01");
+      toast("Saved " + monthLabel(month) + (rate != null ? " — " + fmtINR(rate) + "/MT" : "") +
+        (changed ? ", " + changed + " batch" + (changed === 1 ? "" : "es") + " re-costed." : "."), "success");
+      loadBreakdownMonth();
+      renderMonthlyProcessingHistory();
       updateLiveSummary();
     } catch (e) {
       toast("Could not save breakdown: " + e.message, "error");
+    }
+  }
+
+  function copyPreviousMonthBreakdown() {
+    const month = selectedBreakdownMonth();
+    const prev = monthBreakdown(prevMonthKey(month));
+    if (!prev) return toast("No figures saved for " + monthLabel(prevMonthKey(month)) + " to copy.", "warn");
+    Object.keys(BREAKDOWN_INPUT_IDS).forEach((k) => { $("#" + BREAKDOWN_INPUT_IDS[k]).value = prev[k] || ""; });
+    $("#s-budgeted-output-mt").value = prev.budgetedMonthlyOutputMT || "";
+    $("#s-use-actual-output").checked = prev.useActualOutput !== false;
+    updateProcessingBreakdownReadout();
+    toast("Copied " + monthLabel(prevMonthKey(month)) + " — change what's different and Save.", "success");
+  }
+
+  async function deleteBreakdownMonth() {
+    const month = selectedBreakdownMonth();
+    if (!monthBreakdown(month)) return toast("Nothing saved for " + monthLabel(month) + ".", "warn");
+    if (!confirm("Remove the " + monthLabel(month) + " breakdown? Its batches go back to the default rate.")) return;
+    const months = Object.assign({}, state.labour.months || {});
+    delete months[month];
+    state.labour = Object.assign({}, state.labour, { months });
+    try {
+      if (state.db) await state.db.doc("settings/labour").set(state.labour);
+      await recomputeMonthProcessing(month);
+      toast(monthLabel(month) + " breakdown removed.", "warn");
+      loadBreakdownMonth();
+      renderMonthlyProcessingHistory();
+    } catch (e) {
+      toast("Could not remove: " + e.message, "error");
     }
   }
 
@@ -2728,8 +2907,11 @@
     [
       "#s-eb-cost", "#s-fuel-cost", "#s-maintenance-cost", "#s-electrical-maintenance-cost",
       "#s-stitching-expense", "#s-sack-expenses", "#s-department-expenses", "#s-staff-salaries",
-      "#s-budgeted-output-mt",
+      "#s-budgeted-output-mt", "#s-use-actual-output",
     ].forEach((sel) => $(sel).addEventListener("input", updateProcessingBreakdownReadout));
+    $("#s-proc-month").addEventListener("change", loadBreakdownMonth);
+    $("#btn-copy-prev-month").addEventListener("click", copyPreviousMonthBreakdown);
+    $("#btn-delete-proc-month").addEventListener("click", deleteBreakdownMonth);
 
     // Job Work — company / product management (admin only)
     if ($("#jw-btn-show-add-company")) {

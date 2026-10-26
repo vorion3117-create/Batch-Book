@@ -577,8 +577,17 @@
         </div>
 
         <div class="card" style="margin-top:16px;">
-          <div class="card-title">Processing cost breakdown (&#8377; per month)</div>
-          <p class="hint">Enter each monthly expense once. Divided by your budgeted monthly output, this gives a &#8377;/MT processing-cost rate that&rsquo;s applied to every batch based on its own MT output. Saving here also copies this rate into the &ldquo;Fallback processing cost per batch&rdquo; field above, so the two always match.</p>
+          <div class="card-title">Processing cost breakdown &mdash; month by month</div>
+          <p class="hint">Pick a month and enter what was actually spent that month on electricity, fuel, maintenance and the rest. The month&rsquo;s total is divided by the MT actually produced that month (from the batches logged here) to give that month&rsquo;s &#8377;/MT rate, and every batch in that month is re-costed with it. Months with nothing entered use the fallback cost above.</p>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:flex-end;">
+            <div class="field" style="flex:1 1 160px; min-width:0;">
+              <label for="s-proc-month">Month</label>
+              <input type="month" id="s-proc-month" />
+            </div>
+            <button class="btn btn-secondary btn-small" id="btn-copy-prev-month" type="button">Copy last month</button>
+            <button class="btn btn-secondary btn-small" id="btn-delete-proc-month" type="button">Remove month</button>
+          </div>
+          <p class="hint" id="proc-month-status" style="margin-top:4px;"></p>
           <div class="field-row" style="grid-template-columns:1fr 1fr;">
             <div class="field">
               <label for="s-eb-cost">EB (electricity) cost</label>
@@ -613,13 +622,25 @@
               <input type="number" min="0" step="any" id="s-staff-salaries" />
             </div>
           </div>
+          <label class="checkbox-row" style="display:flex; gap:8px; align-items:flex-start; margin-top:6px; text-transform:none; white-space:normal;">
+            <input type="checkbox" id="s-use-actual-output" checked />
+            <span>Divide by the actual output logged this month (recommended)</span>
+          </label>
           <div class="field" style="max-width:280px; margin-top:4px;">
-            <label for="s-budgeted-output-mt">Budgeted monthly output (MT)</label>
+            <label for="s-budgeted-output-mt">Budgeted output (MT) &mdash; used only if no batches are logged yet, or the box above is off</label>
             <input type="number" min="0" step="any" id="s-budgeted-output-mt" placeholder="e.g. 300" />
           </div>
-          <div class="summary-row" style="margin-top:12px;"><span class="k">Monthly total</span><span class="v" id="proc-monthly-total">&#8377;0</span></div>
-          <div class="summary-row"><span class="k">Rate applied per batch</span><span class="v" id="proc-per-mt-rate">Not set up &mdash; using fallback</span></div>
-          <button class="btn btn-primary" id="btn-save-processing-breakdown" style="margin-top:8px;">Save breakdown</button>
+          <div class="summary-row" style="margin-top:12px;"><span class="k">Month total</span><span class="v" id="proc-monthly-total">&#8377;0</span></div>
+          <div class="summary-row"><span class="k">Actual output logged this month</span><span class="v" id="proc-actual-mt">0 MT</span></div>
+          <div class="summary-row"><span class="k">Processing rate for this month</span><span class="v" id="proc-per-mt-rate">&mdash;</span></div>
+          <button class="btn btn-primary" id="btn-save-processing-breakdown" style="margin-top:8px;">Save month &amp; re-cost its batches</button>
+          <div class="table-wrap" style="margin-top:16px; overflow-x:auto; max-width:100%;">
+            <table>
+              <thead><tr><th>Month</th><th class="num">EB + fuel</th><th class="num">Maintenance</th><th class="num">Other</th><th class="num">Total</th><th class="num">Output MT</th><th class="num">&#8377;/MT</th></tr></thead>
+              <tbody id="proc-history-body"></tbody>
+            </table>
+          </div>
+          <p class="hint">Tap a month in the table to open it.</p>
         </div>
 
         <div class="card" style="margin-top:16px;">
