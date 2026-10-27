@@ -45,10 +45,6 @@
     ebCost: 0, fuelCost: 0, maintenanceCost: 0, electricalMaintenanceCost: 0,
     stitchingExpense: 0, sackExpenses: 0, departmentExpenses: 0, staffSalaries: 0,
     budgetedMonthlyOutputMT: 0,
-    // Month-by-month breakdown — { "YYYY-MM": { ebCost, fuelCost, ..., budgetedMonthlyOutputMT, useActualOutput } }.
-    // When a batch's month has its own entry here, that month's figures are
-    // used for its processing cost instead of the single default breakdown.
-    months: {},
   };
   const PROCESSING_BREAKDOWN_FIELDS = [
     "ebCost", "fuelCost", "maintenanceCost", "electricalMaintenanceCost",
@@ -79,112 +75,402 @@
   }
 
   // ---------------------------------------------------------------
-  // Monthly processing cost — each month can carry its own expenses
-  // (EB, fuel, maintenance, ...). That month's ₹/MT rate is its total
-  // expenses divided by either the MT actually logged in the Batch Book
-  // that month (default) or a budgeted MT figure, and every batch dated
-  // in that month gets rate × its own MT output.
+  // Floating monthly processing rate. Once a month is over, its batches
+  // are re-costed at that month's ACTUAL processing expenses divided by
+  // that month's ACTUAL output, instead of the fixed budget ÷ budgeted MT.
+  // For each cost head the month uses, in order: a figure typed in here
+  // (Settings → Monthly actual processing cost), else the bills logged in
+  // the EMR Tracker's Expenses tab, else the monthly budget above. The
+  // current month stays on the budget rate until it closes.
   // ---------------------------------------------------------------
-  function monthKeyOf(date) { return date ? String(date).slice(0, 7) : ""; }
-
-  function monthBreakdown(month) {
-    const months = (state.labour && state.labour.months) || {};
-    return month && months[month] ? months[month] : null;
+  const EXPENSE_CATEGORY_FIELD = {
+    "EB Bills": "ebCost",
+    // "Fuel & Transport" bills (firewood, LPG, diesel, petrol…) are NOT
+    // production fuel — dryer fuel is only the cashew shell cake bought
+    // from Janani Cashew (Orathur) and Royal Gold Cashew (Vikravandi).
+    "Maintenance & Repairs": "maintenanceCost",
+    "Salaries & Wages": "staffSalaries",
+    "Miscellaneous": "departmentExpenses",
+    "Stitching": "stitchingExpense",
+  };
+  const PROCESSING_FIELD_LABELS = {
+    ebCost: "EB", fuelCost: "Fuel (cashew shell)", maintenanceCost: "Maintenance", electricalMaintenanceCost: "Electrical maint.",
+    stitchingExpense: "Stitching", sackExpenses: "Sack", departmentExpenses: "Department / misc", staffSalaries: "Staff salaries",
+  };
+  function monthOf(date) { return String(date || "").slice(0, 7); }
+  const FUEL_SUPPLIERS = {}; // Vorion: no linked expense tracker
+  function fuelFactoryFor(supplier) {
+    if (FUEL_SUPPLIERS[supplier]) return FUEL_SUPPLIERS[supplier];
+    if (/janani/i.test(supplier || "")) return "Plant";
+    if (/royal/i.test(supplier || "") && /cashew/i.test(supplier || "")) return "Vikravandi";
+    return null;
   }
-
-  // Total MT logged in a month, counting only batches that use the
-  // breakdown rate (products with their own fixed processing cost are left out).
-  function actualOutputMTForMonth(month) {
-    return state.entries
-      .filter((e) => monthKeyOf(e.date) === month && productProcessingCostOverride(e.productId) == null)
-      .reduce((s, e) => s + (Number(e.outputQty) || 0), 0) / KG_PER_MT;
+  function isWageLine(d) { return d && d.category === "Salaries & Wages" && /loadman|loadmen|operator/i.test(d.paidTo || ""); }
+  // A factory's actual loadman + operator wages for a month, from the
+  // salary sheets entered in the EMR Tracker.
+  // A wage line tagged with products (forProducts: [productId…]) — e.g. a
+  // contract mixing crew that only makes certain products — is charged to
+  // those products' batches only, not spread over the whole factory.
+  function productWageTags(d) { return d && Array.isArray(d.forProducts) && d.forProducts.length ? d.forProducts : null; }
+  function monthLabourPool(m, factory) {
+    return state.trackerExpenses.reduce((a, d) => a + (monthOf(d.date) === m && d.branch === factory && isWageLine(d) && !productWageTags(d) ? Number(d.amount) || 0 : 0), 0);
   }
-
-  // Which MT figure divides the month's expenses, and where it came from.
-  function monthOutputBasis(mb, month) {
-    if (mb.useActualOutput !== false) {
-      const actual = actualOutputMTForMonth(month);
-      if (actual > 0) return { mt: actual, source: "actual" };
-    }
-    const budget = Number(mb.budgetedMonthlyOutputMT) || 0;
-    return { mt: budget, source: budget > 0 ? "budget" : "none" };
+  function monthTaggedWages(m, factory) {
+    return state.trackerExpenses.filter((d) => monthOf(d.date) === m && d.branch === factory && isWageLine(d) && productWageTags(d));
   }
-
-  // ₹/MT for a given batch date: that month's own breakdown if it has one,
-  // otherwise the default breakdown, otherwise null (flat fallback).
-  function processingRateForDate(date) {
-    const month = monthKeyOf(date);
-    const mb = monthBreakdown(month);
-    if (mb) {
-      const basis = monthOutputBasis(mb, month);
-      if (basis.mt > 0) return monthlyProcessingCostTotal(mb) / basis.mt;
-    }
-    return processingCostPerMT(state.labour);
-  }
-
-  // The processing cost a batch should carry right now: its product's own
-  // fixed cost if it has one, else its month's ₹/MT rate × its own MT
-  // output, else the flat per-batch fallback.
-  function expectedProcessingCost(e) {
-    const override = productProcessingCostOverride(e.productId);
-    if (override != null) return override;
-    const rate = processingRateForDate(e.date);
-    return rate != null ? rate * ((Number(e.outputQty) || 0) / KG_PER_MT) : (Number(state.labour.processingCost) || 0);
-  }
-
-  // Rewrites processingCost/totalCost/costPerKg (and jobworkProfit) on every
-  // batch whose stored figure no longer matches the current breakdown, so
-  // stored figures always follow the latest monthly rate. Pass a month
-  // ("YYYY-MM") to limit it to that month, or nothing for every month.
-  async function recomputeMonthProcessing(month) {
-    const rows = state.entries.filter((e) => e.date && (!month || monthKeyOf(e.date) === month));
-    const updates = [];
-    rows.forEach((e) => {
-      const proc = expectedProcessingCost(e);
-      if (Math.abs(proc - (Number(e.processingCost) || 0)) < 0.005) return;
-      const totalCost = (Number(e.rmCost) || 0) + proc + (Number(e.labourCost) || 0);
-      const fields = { processingCost: proc, totalCost, costPerKg: e.outputQty > 0 ? totalCost / e.outputQty : 0 };
-      if (e.jobworkCompanyId) fields.jobworkProfit = (Number(e.jobworkRevenue) || 0) - totalCost;
-      updates.push({ id: e.id, fields });
+  function salarySheetFor(m, factory) {
+    const out = { loadAmt: 0, loadHead: 0, opAmt: 0, opHead: 0 };
+    state.trackerExpenses.forEach((d) => {
+      if (monthOf(d.date) !== m || d.branch !== factory || !isWageLine(d) || productWageTags(d)) return;
+      const txt = d.paidTo || "";
+      if (/loadm/i.test(txt)) { out.loadAmt += Number(d.amount) || 0; const h = txt.match(/\((\d+)\s*loadmen/i); if (h) out.loadHead += Number(h[1]); }
+      else { out.opAmt += Number(d.amount) || 0; const h = txt.match(/\((\d+)\s*operators/i); if (h) out.opHead += Number(h[1]); }
     });
-    if (!updates.length) return 0;
-    updates.forEach((u) => {
-      const idx = state.entries.findIndex((e) => e.id === u.id);
-      if (idx !== -1) state.entries[idx] = Object.assign({}, state.entries[idx], u.fields);
+    return out;
+  }
+  function attendanceFor(date, factory) {
+    const a = state.attendance[dayLabourKey(date, factory)];
+    return a ? { operators: Number(a.operators) || 0, loadmen: Number(a.loadmen) || 0 } : null;
+  }
+  function labourOverrideFor(e) {
+    const c = companyLabourCostOverride(e.jobworkCompanyId);
+    if (c != null) return c * ((Number(e.outputQty) || 0) / KG_PER_MT);
+    const p = productLabourCostOverride(e.productId);
+    return p != null ? p : null;
+  }
+  // Month-end labour: the factory's actual wages are spread over the days
+  // by attendance (operators + loadmen present), then over each day's
+  // batches by output. Batches with a fixed labour rate keep it. Days
+  // without attendance fall back to sharing by output.
+  function monthLabourAllocation(m, factory, rows) {
+    let pool = monthLabourPool(m, factory);
+    const tagged = monthTaggedWages(m, factory);
+    if (!(pool > 0)) return null;
+    const out = {};
+    let fixed = 0;
+    const flt = [];
+    rows.forEach((e) => { const o = labourOverrideFor(e); if (o != null) { out[e.id] = o; fixed += o; } else flt.push(e); });
+    // Product-tagged wages go to that month's batches of those products
+    // (by output). If none of them were made that month, the amount joins
+    // the factory's general pool instead.
+    const extra = {};
+    tagged.forEach((d) => {
+      const amt = Number(d.amount) || 0;
+      const hit = flt.filter((e) => d.forProducts.indexOf(e.productId) !== -1);
+      const kg = hit.reduce((x, e) => x + (Number(e.outputQty) || 0), 0);
+      if (!(kg > 0)) { pool += amt; return; }
+      hit.forEach((e) => { extra[e.id] = (extra[e.id] || 0) + amt * (Number(e.outputQty) || 0) / kg; });
     });
-    if (state.db) {
-      for (let i = 0; i < updates.length; i += 400) {
-        const batch = state.db.batch();
-        updates.slice(i, i + 400).forEach((u) => {
-          if (!String(u.id).startsWith("local_")) batch.update(state.db.collection("entries").doc(u.id), u.fields);
-        });
-        await batch.commit();
+    const rem = Math.max(0, pool - fixed);
+    const byDay = {};
+    flt.forEach((e) => { (byDay[e.date] = byDay[e.date] || []).push(e); });
+    const days = Object.keys(byDay);
+    const allHave = days.length && days.every((d) => { const a = attendanceFor(d, factory); return a && (a.operators + a.loadmen) > 0; });
+    const dayW = {};
+    let tw = 0;
+    days.forEach((d) => {
+      const a = attendanceFor(d, factory);
+      const w = allHave ? (a.operators + a.loadmen) : byDay[d].reduce((x, e) => x + (Number(e.outputQty) || 0), 0);
+      dayW[d] = w; tw += w;
+    });
+    days.forEach((d) => {
+      const share = tw > 0 ? rem * dayW[d] / tw : 0;
+      const kg = byDay[d].reduce((x, e) => x + (Number(e.outputQty) || 0), 0);
+      byDay[d].forEach((e) => { out[e.id] = kg > 0 ? share * (Number(e.outputQty) || 0) / kg : 0; });
+    });
+    Object.keys(extra).forEach((id) => { out[id] = (out[id] || 0) + extra[id]; });
+    return { alloc: out, basis: allHave ? "attendance" : "output" };
+  }
+  function monthLabelShort(m) { return new Date(m + "-01T00:00:00").toLocaleDateString("en-IN", { month: "short", year: "numeric" }); }
+  function isClosedMonth(m) { return /^\d{4}-\d{2}$/.test(m) && m < todayStr().slice(0, 7); }
+
+  // Factories — every batch is tagged with the one it was made at, and
+  // each factory's month is costed from its own bills and its own output.
+  const FACTORIES = ["Plant"]; // Vorion: one plant
+  // Records from before factories were tracked (and stock docs saved
+  // without one) all belong to Orathur.
+  function factoryOf(x) { return x && FACTORIES.indexOf(x.factory) !== -1 ? x.factory : "Plant"; }
+  function inFactory(x, f) { return !f || factoryOf(x) === f; }
+  function inView(x) { return inFactory(x, state.viewFactory); }
+  // Which factory the stock ledger's helpers work on. Equal to the
+  // factory picked at the top, or switched factory-by-factory when the
+  // consolidated (both) view sums the two ledgers.
+  let stockScope = "";
+  // A month is costed per factory once every batch in it is tagged;
+  // until then the whole month is costed company-wide (both factories'
+  // bills over both factories' output), so nothing is left unallocated.
+  function monthGroups(rows) {
+    if (rows.length && rows.every((e) => FACTORIES.indexOf(e.factory) !== -1)) {
+      return FACTORIES.map((f) => ({ factory: f, rows: rows.filter((e) => e.factory === f) })).filter((g) => g.rows.length);
+    }
+    return [{ factory: "", rows }];
+  }
+  function manualKey(m, factory) { return factory ? m + "|" + factory : m; }
+
+  // Each cost head's figure for one factory (or "" = both) in month m and
+  // where it came from. share = this factory's part of the month's output,
+  // used to split the company-wide monthly budget for heads with no bill.
+  function monthProcessingActuals(m, factory, share) {
+    if (share == null) share = 1;
+    const fromBills = {};
+    state.trackerExpenses.forEach((d) => {
+      if (monthOf(d.date) !== m) return;
+      if (d.category === "Salaries & Wages") {
+        // Loadman / operator wages are each factory's own labour cost
+        // (costed from attendance, see the Attendance tab), not processing.
+        if (isWageLine(d)) return;
+        // Staff salaries are common to both factories: shared by each
+        // factory's part of the month's total production.
+        fromBills.staffSalaries = (fromBills.staffSalaries || 0) + (Number(d.amount) || 0) * (factory ? share : 1);
+        return;
       }
-    } else {
-      renderTodayList();
-      renderReports();
-    }
-    return updates.length;
+      if (factory && d.branch && d.branch !== factory) return;
+      const k = EXPENSE_CATEGORY_FIELD[d.category];
+      if (!k) return;
+      // A bill with no branch is shared between the factories by output.
+      const amt = (Number(d.amount) || 0) * (factory && !d.branch ? share : 1);
+      fromBills[k] = (fromBills[k] || 0) + amt;
+    });
+    // Dryer fuel = cashew shell cake bought for that factory (Purchases in
+    // the EMR Tracker): Janani Cashew → Orathur, Royal Gold Cashew → Vikravandi.
+    let fuelPurch = 0;
+    state.fuelPurchases.forEach((pu) => {
+      if (monthOf(pu.date) !== m) return;
+      // A purchase can say which factory received it (e.g. a Royal load
+      // delivered to Orathur); otherwise the supplier's usual factory.
+      const f = (pu.fuelFactory === "Plant" || pu.fuelFactory === "Vikravandi") ? pu.fuelFactory : fuelFactoryFor(pu.supplier);
+      if (!f || (factory && f !== factory)) return;
+      fuelPurch += Number(pu.value) || 0;
+    });
+    fromBills.fuelCost = (fromBills.fuelCost || 0) + fuelPurch;
+    const manual = state.processingMonths[manualKey(m, factory)] || {};
+    const fields = {};
+    let total = 0;
+    PROCESSING_BREAKDOWN_FIELDS.forEach((k) => {
+      let amount, source;
+      if (manual[k] !== undefined && manual[k] !== null && manual[k] !== "") { amount = Number(manual[k]) || 0; source = "manual"; }
+      else if (fromBills[k]) { amount = fromBills[k]; source = "bills"; }
+      // Fuel is always the actual purchases — no budget fallback; a month
+      // with no shell-cake purchase for that factory carries no fuel.
+      else if (k === "fuelCost") { amount = 0; source = "bills"; }
+      else { amount = (Number(state.labour[k]) || 0) * share; source = "budget"; }
+      fields[k] = { amount, source };
+      total += amount;
+    });
+    return { fields, total };
   }
 
-  // Automatic re-costing: whenever batches, the monthly breakdown or
-  // product costs change (on this device or another), bring every batch
-  // in line with its month's current rate. Debounced so a burst of
-  // changes causes one pass; writes only what actually differs, so it
-  // settles after one round.
-  let reconcileTimer = null, reconcileRunning = false;
-  function scheduleProcessingReconcile() {
-    if (!state.role) return; // only once someone has logged in
-    clearTimeout(reconcileTimer);
-    reconcileTimer = setTimeout(async () => {
-      if (reconcileRunning) return scheduleProcessingReconcile();
-      reconcileRunning = true;
-      try {
-        const n = await recomputeMonthProcessing();
-        if (n) { renderReports(); renderMonthlyProcessingHistory(); }
-      } catch (e) { /* next change retries */ }
-      reconcileRunning = false;
-    }, 1500);
+  // ₹/MT for the batches of one factory-group in a closed month that don't
+  // have a fixed per-product processing cost. Products with a fixed cost
+  // keep it; the rest of the group's actual pool is spread over the other
+  // batches' output so the whole actual cost is absorbed.
+  function groupRate(m, group, monthKg) {
+    if (!isClosedMonth(m)) return null;
+    let fixed = 0, floatKg = 0, groupKg = 0;
+    group.rows.forEach((e) => {
+      groupKg += Number(e.outputQty) || 0;
+      const ov = productProcessingCostOverride(e.productId);
+      if (ov != null) fixed += ov; else floatKg += Number(e.outputQty) || 0;
+    });
+    if (floatKg <= 0) return null;
+    const share = group.factory && monthKg > 0 ? groupKg / monthKg : 1;
+    return Math.max(0, monthProcessingActuals(m, group.factory, share).total - fixed) / (floatKg / KG_PER_MT);
+  }
+  // Rate for a batch about to be saved (live summary on the form).
+  function floatingRateFor(m, factory) {
+    const rows = state.entries.filter((e) => monthOf(e.date) === m && e.id !== state.editingEntryId);
+    const monthKg = rows.reduce((a, e) => a + (Number(e.outputQty) || 0), 0);
+    const groups = monthGroups(rows);
+    const g = groups.find((x) => x.factory === (groups[0].factory ? factory : "")) || null;
+    return g ? groupRate(m, g, monthKg) : null;
+  }
+
+  // Monthly output is not a fixed budget figure: at every month end it is
+  // taken from that month's batches. While a month is running, its batches
+  // are costed at the last finished month's actual rate for that factory
+  // (that month's actual processing cost ÷ its actual output) and then
+  // re-costed at their own month's actual rate once the month closes.
+  function lastClosedMonthFor(factory) {
+    const months = Array.from(new Set(state.entries.filter((e) => !factory || factoryOf(e) === factory).map((e) => monthOf(e.date))))
+      .filter((m) => isClosedMonth(m)).sort().reverse();
+    for (const m of months) {
+      const kg = state.entries.reduce((a, e) => a + (monthOf(e.date) === m && (!factory || factoryOf(e) === factory) ? Number(e.outputQty) || 0 : 0), 0);
+      if (kg > 0) return { month: m, mt: kg / KG_PER_MT };
+    }
+    return null;
+  }
+  function runningRateFor(factory) {
+    const last = lastClosedMonthFor(factory);
+    if (!last) return null;
+    const rows = state.entries.filter((e) => monthOf(e.date) === last.month);
+    const monthKg = rows.reduce((a, e) => a + (Number(e.outputQty) || 0), 0);
+    const groups = monthGroups(rows);
+    const g = groups.find((x) => x.factory === (groups[0].factory ? factory : "")) || null;
+    let rate = g ? groupRate(last.month, g, monthKg) : null;
+    // No actual rate for that month (e.g. every batch on a fixed rate):
+    // the monthly budget amounts ÷ that month's actual output.
+    if (rate == null && last.mt > 0) {
+      const total = monthlyProcessingCostTotal(state.labour);
+      rate = total > 0 ? total / last.mt : null;
+    }
+    return rate == null ? null : { rate, month: last.month, mt: last.mt };
+  }
+
+  // Re-costs every batch of one closed month at its group's floating rate.
+  // Only writes batches whose processing cost actually changes.
+  // Labour estimate for batches with no crew counted (no operators/loadmen
+  // on the batch and no attendance for that day) in a month that has no
+  // salary sheet yet — e.g. the running month, or older Vikravandi months
+  // before its sheets were entered. Uses the factory's actual labour ₹/MT
+  // (salary-sheet wages ÷ output) from the nearest finished month that has
+  // a sheet: the latest one before, else the first one after.
+  function labourRatePerMT(factory, m) {
+    const months = Array.from(new Set(state.entries.filter((e) => factoryOf(e) === factory).map((e) => monthOf(e.date))))
+      .filter((x) => x !== m && isClosedMonth(x) && monthLabourPool(x, factory) > 0).sort();
+    const pick = months.filter((x) => x < m).pop() || months.find((x) => x > m);
+    if (!pick) return null;
+    const kg = state.entries.reduce((a, e) => a + (monthOf(e.date) === pick && factoryOf(e) === factory ? Number(e.outputQty) || 0 : 0), 0);
+    if (!(kg > 0)) return null;
+    const wages = monthLabourPool(pick, factory) + monthTaggedWages(pick, factory).reduce((a, d) => a + (Number(d.amount) || 0), 0);
+    return { rate: wages / (kg / KG_PER_MT), month: pick };
+  }
+  function needsLabourEstimate(e) {
+    if (labourOverrideFor(e) != null) return false;
+    if ((Number(e.operators) || 0) + (Number(e.loadmen) || 0) > 0) return false;
+    if (attendanceFor(e.date, factoryOf(e))) return false;
+    return !(Number(e.labourCost) > 0) || !!e.labourEstimate;
+  }
+  // Running month: give uncounted batches the estimate now (the month-end
+  // salary-sheet allocation replaces it once the month closes).
+  async function recostRunningLabour() {
+    if (!state.db) return 0;
+    const batch = state.db.batch();
+    let n = 0;
+    state.entries.forEach((e) => {
+      const m = monthOf(e.date);
+      if (!/^\d{4}-\d{2}$/.test(m) || isClosedMonth(m) || !needsLabourEstimate(e)) return;
+      const r = labourRatePerMT(factoryOf(e), m);
+      if (!r) return;
+      const lab = r.rate * ((Number(e.outputQty) || 0) / KG_PER_MT);
+      if (Math.abs(lab - (Number(e.labourCost) || 0)) < 0.5 && e.labourEstimate) return;
+      const totalCost = (Number(e.rmCost) || 0) + (Number(e.processingCost) || 0) + lab;
+      const fields = { labourCost: lab, totalCost, costPerKg: e.outputQty > 0 ? totalCost / e.outputQty : 0, labourEstimate: true, labourBasis: "estimate — " + monthLabelShort(r.month) + " actual ₹/MT" };
+      if (e.jobworkCompanyId) fields.jobworkProfit = (Number(e.jobworkRevenue) || 0) - totalCost;
+      if (state.autoRecalcRun) { if (!canAutoWrite(e.id)) return; noteAutoWrite(e.id); }
+      batch.update(state.db.collection("entries").doc(e.id), fields);
+      n++;
+    });
+    if (n) await batch.commit();
+    return n;
+  }
+
+  async function recalcMonthProcessing(m) {
+    if (!state.db || !isClosedMonth(m)) return 0;
+    const snap = await state.db.collection("entries").where("date", ">=", m + "-01").where("date", "<=", m + "-31").get();
+    const rows = snap.docs.map((d) => Object.assign({ id: d.id }, d.data()));
+    const monthKg = rows.reduce((a, e) => a + (Number(e.outputQty) || 0), 0);
+    const batch = state.db.batch();
+    let n = 0;
+    const newProc = {}, procMeta = {};
+    monthGroups(rows).forEach((g) => {
+      const rate = groupRate(m, g, monthKg);
+      if (rate == null) return;
+      g.rows.forEach((e) => {
+        const ov = productProcessingCostOverride(e.productId);
+        newProc[e.id] = ov != null ? ov : rate * ((Number(e.outputQty) || 0) / KG_PER_MT);
+        procMeta[e.id] = { processingRatePerMT: ov != null ? null : rate, processingRateMonth: m, processingRateGroup: g.factory || "both" };
+      });
+    });
+    const newLab = {}, labBasis = {}, labEst = {};
+    FACTORIES.forEach((f) => {
+      const fr = rows.filter((e) => factoryOf(e) === f);
+      const r = monthLabourAllocation(m, f, fr);
+      if (r) { Object.keys(r.alloc).forEach((id) => { newLab[id] = r.alloc[id]; labBasis[id] = r.basis; }); return; }
+      // No salary sheet for this factory and month: estimate the batches
+      // that have no crew counted at all.
+      const est = labourRatePerMT(f, m);
+      if (!est) return;
+      fr.forEach((e) => {
+        if (!needsLabourEstimate(e)) return;
+        newLab[e.id] = est.rate * ((Number(e.outputQty) || 0) / KG_PER_MT);
+        labEst[e.id] = est.month;
+      });
+    });
+    rows.forEach((e) => {
+      const proc = newProc[e.id] != null ? newProc[e.id] : (Number(e.processingCost) || 0);
+      const lab = newLab[e.id] != null ? newLab[e.id] : (Number(e.labourCost) || 0);
+      const pm = procMeta[e.id];
+      const procSame = Math.abs(proc - (Number(e.processingCost) || 0)) < 0.5 && (!pm || (e.processingRateMonth === m && e.processingRateGroup === pm.processingRateGroup));
+      const labSame = Math.abs(lab - (Number(e.labourCost) || 0)) < 0.5 && (newLab[e.id] == null || e.labourMonth === m);
+      if (procSame && labSame) return;
+      const totalCost = (Number(e.rmCost) || 0) + proc + lab;
+      const fields = Object.assign({ processingCost: proc, labourCost: lab, totalCost, costPerKg: e.outputQty > 0 ? totalCost / e.outputQty : 0 }, pm || {});
+      if (labEst[e.id]) { fields.labourMonth = m; fields.labourEstimate = true; fields.labourBasis = "estimate — " + monthLabelShort(labEst[e.id]) + " actual ₹/MT"; }
+      else if (newLab[e.id] != null) { fields.labourMonth = m; fields.labourEstimate = false; fields.labourBasis = "salary sheet by " + labBasis[e.id]; }
+      if (e.jobworkCompanyId) fields.jobworkProfit = (Number(e.jobworkRevenue) || 0) - totalCost;
+      if (state.autoRecalcRun) { if (!canAutoWrite(e.id)) return; noteAutoWrite(e.id); }
+      batch.update(state.db.collection("entries").doc(e.id), fields);
+      n++;
+    });
+    if (n) await batch.commit();
+    return n;
+  }
+
+  // Safety against two copies of Batch Book (e.g. an old version left open
+  // on another phone) re-costing the same batches back and forth forever:
+  //  • every copy records its costing version; an older copy stops writing
+  //    and asks to be reloaded;
+  //  • automatic runs happen at most once every 5 minutes per copy;
+  //  • one copy never rewrites the same batch more than 3 times per visit.
+  const CALC_VERSION = 51;
+  const autoWriteCount = {};
+  let lastAutoRecalcAt = 0;
+  function canAutoWrite(id) { return (autoWriteCount[id] || 0) < 3; }
+  function noteAutoWrite(id) { autoWriteCount[id] = (autoWriteCount[id] || 0) + 1; }
+  async function calcVersionOk() {
+    try {
+      const ref = state.db.doc("settings/calcVersion");
+      const snap = await ref.get();
+      const v = snap.exists ? Number(snap.data().version) || 0 : 0;
+      if (v > CALC_VERSION) {
+        if (!state.calcOutdatedWarned) { state.calcOutdatedWarned = true; toast("A newer Batch Book version is in use — please reload this page.", "warn"); }
+        return false;
+      }
+      if (v < CALC_VERSION) await ref.set({ version: CALC_VERSION, at: new Date().toISOString() });
+      return true;
+    } catch (e) { return false; }
+  }
+
+  async function recalcAllClosedMonths(manual) {
+    if (!state.db) { if (manual) toast("Open the published link to recalculate.", "warn"); return; }
+    if (!manual) {
+      const now = Date.now();
+      if (now - lastAutoRecalcAt < 5 * 60 * 1000) return;
+      lastAutoRecalcAt = now;
+    }
+    if (!(await calcVersionOk())) return;
+    state.autoRecalcRun = !manual;
+    const months = Array.from(new Set(state.entries.map((e) => monthOf(e.date)))).filter(isClosedMonth).sort();
+    let changed = 0;
+    try {
+      for (const m of months) changed += await recalcMonthProcessing(m);
+      changed += await recostRunningLabour();
+      if (manual || changed) toast(changed ? "Processing cost re-costed on " + changed + " batch" + (changed === 1 ? "" : "es") + " using each month's actual rate." : "All past months are already at their actual rate.", "success");
+    } catch (e) {
+      toast("Could not recalculate processing costs: " + e.message, "error");
+    } finally {
+      state.autoRecalcRun = false;
+    }
+  }
+
+  // Runs automatically for admins once bills, manual figures and batches
+  // have all loaded, and again whenever any of them changes.
+  let autoRecalcTimer = null;
+  function maybeAutoRecalc() {
+    const f = state.floatLoaded;
+    if (state.role !== "admin" || !state.db || !f.expenses || !f.months || !f.entries) return;
+    clearTimeout(autoRecalcTimer);
+    autoRecalcTimer = setTimeout(() => recalcAllClosedMonths(false), 2500);
   }
 
   // Units offered everywhere a material or product's unit is picked.
@@ -231,6 +517,12 @@
     teamHash: "6af6ccfc140ef94bad571fe7ec0c6d2fe69884b7249dbf84388a8a6af411282f",
   };
   const ROLE_STORAGE_KEY = "vorion_bb_role";
+  // Third role: a job-work company (SFL, Rajshree, SKY WIN…) logging in
+  // with its own password sees ONLY the Stock tab, locked to its own
+  // company's rows — no batches, costs, rates, other companies or
+  // Settings. Hashes live in settings/access as companyHashes[companyId].
+  // Stored in sessionStorage as "company:<companyId>".
+  const COMPANY_ROLE_PREFIX = "company:";
   // Tabs a "team" role cannot see — they show costs, rates and wages.
   const ADMIN_ONLY_TABS = ["settings"];
 
@@ -249,15 +541,22 @@
     products: DEFAULT_PRODUCTS.slice(),
     labour: Object.assign({}, DEFAULT_LABOUR),
     access: Object.assign({}, DEFAULT_ACCESS),
-    role: null, // "admin" | "team" | null (locked)
+    role: null, // "admin" | "team" | "company" | null (locked)
+    companyId: "", // set only for the "company" role — the one company it may see
     entries: [],
     stock: [],
-    dayLabour: {}, // date -> { operators, loadmen } — the shared day-crew doc, cached per date as it's loaded
+    dayLabour: {}, // dayLabourKey(date, factory) -> { operators, loadmen } — that factory's daily attendance, cached as loaded
+    attendance: {}, // every dayLabour doc (live), for the monthly attendance vs salary-sheet check
     activeTab: "entry",
     materialFilter: "",
     reportFilter: { start: "", end: "", productId: "" },
     editingEntryId: null, // set while the form is editing an existing batch instead of logging a new one
     jobworkCompanies: DEFAULT_JOBWORK_COMPANIES.slice(),
+    viewFactory: "", // "" = both factories (consolidated), or "Plant" / "Vikravandi"
+    trackerExpenses: [],
+    fuelPurchases: [], // cashew shell cake purchases (dryer fuel) from the EMR Tracker // read-only copy of the EMR Tracker's expense log (tracker_expenses) — actual monthly bills
+    processingMonths: {}, // settings/processingMonths.months — manual actuals per month: { "YYYY-MM": { ebCost: n, ... } }
+    floatLoaded: { expenses: false, months: false, entries: false },
   };
 
   // ---------------------------------------------------------------
@@ -316,7 +615,7 @@
     if (!c || !productId) return null;
     return (c.products || []).find((p) => p.productId === productId) || null;
   }
-  // Some job-work companies (e.g. customers who agree a price per order)
+  // Some job-work companies (e.g. EMR Fertilizers, EMR Agro Industries)
   // don't have one fixed ₹/MT rate at all — the sales team agrees a rate
   // with the customer per order, based on the raw material and quality
   // that specific order needs. For those, the Log Batch form skips the
@@ -372,7 +671,7 @@
     return Number(company.labourCost) || 0;
   }
 
-  function computeCosts(materialsQty, outputQty, operators, loadmen, productId, companyId, date) {
+  function computeCosts(materialsQty, outputQty, operators, loadmen, productId, companyId, date, factory) {
     let rmCost = 0;
     state.materials.forEach((m) => {
       const q = Number(materialsQty[m.id]) || 0;
@@ -383,7 +682,9 @@
     if (override != null) {
       processingCost = override;
     } else {
-      const perMT = processingRateForDate(date);
+      const floating = date ? floatingRateFor(monthOf(date), factory) : null;
+      const running = floating == null ? runningRateFor(factory || "Plant") : null;
+      const perMT = floating != null ? floating : running ? running.rate : processingCostPerMT(state.labour);
       processingCost = perMT != null
         ? perMT * (outputQty / KG_PER_MT)
         : (Number(state.labour.processingCost) || 0);
@@ -397,6 +698,10 @@
       labourCost = companyLabour * (outputQty / KG_PER_MT);
     } else if (productLabour != null) {
       labourCost = productLabour;
+    } else if ((Number(operators) || 0) + (Number(loadmen) || 0) === 0 && date && !attendanceFor(date, factory || "Plant") && labourRatePerMT(factory || "Plant", monthOf(date))) {
+      // No crew counted for this batch or day: estimate from the factory's
+      // last actual labour ₹/MT until attendance or the salary sheet is in.
+      labourCost = labourRatePerMT(factory || "Plant", monthOf(date)).rate * (outputQty / KG_PER_MT);
     } else {
       labourCost = (Number(operators) || 0) * (Number(state.labour.operatorRate) || 0) +
         (Number(loadmen) || 0) * (Number(state.labour.loadmanRate) || 0);
@@ -416,22 +721,34 @@
   // normal per-batch number) if it has its own product or company labour
   // rate override, or never opted into the day split at all.
   // ---------------------------------------------------------------
-  async function loadDayLabourForDate(date) {
+  // Daily attendance is kept per factory: Orathur keeps the original
+  // dayLabour/<date> documents, Vikravandi uses dayLabour/<date>_Vikravandi.
+  function dayLabourKey(date, factory) { return factory === "Vikravandi" ? date + "_Vikravandi" : date; }
+  function wageRatesFor(factory) {
+    const L = state.labour;
+    if (factory === "Vikravandi") return {
+      op: L.vkdOperatorRate != null && L.vkdOperatorRate !== "" ? Number(L.vkdOperatorRate) : (Number(L.operatorRate) || 0),
+      ld: L.vkdLoadmanRate != null && L.vkdLoadmanRate !== "" ? Number(L.vkdLoadmanRate) : (Number(L.loadmanRate) || 0),
+    };
+    return { op: Number(L.operatorRate) || 0, ld: Number(L.loadmanRate) || 0 };
+  }
+  async function loadDayLabourForDate(date, factory) {
     if (!date) return null;
-    if (state.dayLabour[date] !== undefined) return state.dayLabour[date];
+    const key = dayLabourKey(date, factory || "Plant");
+    if (state.dayLabour[key] !== undefined) return state.dayLabour[key];
     if (!state.db) return null;
     try {
-      const doc = await state.db.collection("dayLabour").doc(date).get();
-      state.dayLabour[date] = doc.exists ? doc.data() : null;
+      const doc = await state.db.collection("dayLabour").doc(key).get();
+      state.dayLabour[key] = doc.exists ? doc.data() : null;
     } catch (e) {
-      state.dayLabour[date] = null;
+      state.dayLabour[key] = null;
     }
-    return state.dayLabour[date];
+    return state.dayLabour[key];
   }
 
-  function dayLabourPoolFor(date) {
+  function dayLabourPoolFor(date, factory) {
     return state.entries.filter((e) =>
-      e.date === date && e.usesDayLabourSplit &&
+      e.date === date && e.usesDayLabourSplit && factoryOf(e) === (factory || "Plant") &&
       companyLabourCostOverride(e.jobworkCompanyId) == null &&
       productLabourCostOverride(e.productId) == null
     );
@@ -442,13 +759,17 @@
   // shared-crew pool. Called after any save/edit/delete that could shift
   // the pool's total output or membership — cheap no-op if that date has
   // no day-crew doc or nothing in the pool.
-  async function recomputeDayLabourSplit(date) {
+  async function recomputeDayLabourSplit(date, factory) {
     if (!date) return;
-    const dayDoc = await loadDayLabourForDate(date);
-    const pool = dayLabourPoolFor(date);
+    factory = factory || "Plant";
+    // A finished month whose salary sheet is in is costed from the actual
+    // wages instead (recalcMonthProcessing) — don't overwrite that here.
+    if (isClosedMonth(monthOf(date)) && monthLabourPool(monthOf(date), factory) > 0) return;
+    const dayDoc = await loadDayLabourForDate(date, factory);
+    const pool = dayLabourPoolFor(date, factory);
     if (!dayDoc || !pool.length) return;
-    const dayLabourCost = (Number(dayDoc.operators) || 0) * (Number(state.labour.operatorRate) || 0) +
-      (Number(dayDoc.loadmen) || 0) * (Number(state.labour.loadmanRate) || 0);
+    const r = wageRatesFor(factory);
+    const dayLabourCost = (Number(dayDoc.operators) || 0) * r.op + (Number(dayDoc.loadmen) || 0) * r.ld;
     const totalOutputKg = pool.reduce((s, e) => s + (Number(e.outputQty) || 0), 0);
     const updates = pool.map((e) => {
       const share = totalOutputKg > 0 ? dayLabourCost * ((Number(e.outputQty) || 0) / totalOutputKg) : 0;
@@ -474,11 +795,14 @@
     }
   }
 
-  async function saveDayLabour(date, operators, loadmen) {
-    const payload = { date, operators: Number(operators) || 0, loadmen: Number(loadmen) || 0, updatedAt: new Date().toISOString() };
-    state.dayLabour[date] = payload;
+  async function saveDayLabour(date, operators, loadmen, factory) {
+    factory = factory || "Plant";
+    const payload = { date, factory, operators: Number(operators) || 0, loadmen: Number(loadmen) || 0, updatedAt: new Date().toISOString() };
+    const key = dayLabourKey(date, factory);
+    state.dayLabour[key] = payload;
+    state.attendance[key] = payload;
     if (state.db) {
-      await state.db.collection("dayLabour").doc(date).set(payload);
+      await state.db.collection("dayLabour").doc(key).set(payload);
     }
   }
 
@@ -772,7 +1096,7 @@
   async function initDb() {
     let db = null;
     try {
-      if (window.firebase && window.BATCH_BOOK_FIREBASE_CONFIG && window.BATCH_BOOK_FIREBASE_CONFIG.projectId) {
+      if (window.firebase && window.BATCH_BOOK_FIREBASE_CONFIG) {
         if (!firebase.apps.length) firebase.initializeApp(window.BATCH_BOOK_FIREBASE_CONFIG);
         db = firebase.firestore();
       }
@@ -811,7 +1135,6 @@
         populateProductSelects();
         renderJobCompanies();
         renderJobPnL();
-        scheduleProcessingReconcile();
       },
       () => {}
     );
@@ -854,7 +1177,6 @@
         }
         renderSettingsLabour();
         updateLiveSummary();
-        scheduleProcessingReconcile();
       },
       () => {}
     );
@@ -865,7 +1187,15 @@
           state.access = {
             adminHash: data.adminHash || DEFAULT_ACCESS.adminHash,
             teamHash: data.teamHash || DEFAULT_ACCESS.teamHash,
+            companyHashes: (data.companyHashes && typeof data.companyHashes === "object") ? data.companyHashes : {},
+            // Plain copy of each company password, shown to admin in
+            // Settings so it can be read out/shared again. Admin and team
+            // passwords stay hash-only.
+            companyPasswords: (data.companyPasswords && typeof data.companyPasswords === "object") ? data.companyPasswords : {},
           };
+          renderCompanyAccessList();
+          // A company whose password was removed/changed is signed out.
+          if (state.role === "company" && !state.access.companyHashes[state.companyId]) lockApp();
         } else {
           // First time the app has ever run — seed the doc with the
           // default passwords so they can be changed from Settings.
@@ -874,18 +1204,40 @@
       },
       () => {}
     );
-    db.collection("entries").orderBy("createdAt", "desc").limit(3000).onSnapshot(
+    db.collection("entries").orderBy("createdAt", "desc").limit(500).onSnapshot(
       (snap) => {
         state.entries = snap.docs.map((d) => Object.assign({ id: d.id }, d.data()));
+        state.floatLoaded.entries = true;
+        renderFloatingRates();
+        maybeAutoRecalc();
         renderTodayList();
         renderReports();
         renderStock();
         renderJobPnL();
-        updateProcessingBreakdownReadout();
-        renderMonthlyProcessingHistory();
-        scheduleProcessingReconcile();
       },
       (e) => { toast("Sync error loading entries: " + e.message, "error"); }
+    );
+    // Vorion has no linked expense tracker: monthly bills are typed in Settings.
+    state.floatLoaded.expenses = true;
+    db.collection("dayLabour").limit(3000).onSnapshot(
+      (snap) => {
+        state.attendance = {};
+        snap.docs.forEach((d) => { state.attendance[d.id] = d.data(); state.dayLabour[d.id] = d.data(); });
+        state.floatLoaded.attendance = true;
+        renderAttendance();
+        maybeAutoRecalc();
+      },
+      () => { state.floatLoaded.attendance = true; }
+    );
+    state.floatLoaded.fuel = true;
+    db.doc("settings/processingMonths").onSnapshot(
+      (snap) => {
+        state.processingMonths = (snap.exists && snap.data().months) || {};
+        state.floatLoaded.months = true;
+        renderFloatingRates();
+        maybeAutoRecalc();
+      },
+      () => { state.floatLoaded.months = true; maybeAutoRecalc(); }
     );
     db.collection("stock").orderBy("date", "desc").limit(500).onSnapshot(
       (snap) => {
@@ -919,8 +1271,14 @@
     try {
       const hash = await sha256Hex(pw);
       let role = null;
+      let companyId = "";
       if (hash === state.access.adminHash) role = "admin";
       else if (hash === state.access.teamHash) role = "team";
+      else {
+        const hashes = state.access.companyHashes || {};
+        companyId = Object.keys(hashes).find((id) => hashes[id] === hash) || "";
+        if (companyId) role = "company";
+      }
       if (!role) {
         lockScreenError("Incorrect password. Try again.");
         input.value = "";
@@ -929,17 +1287,26 @@
       }
       lockScreenError(null);
       input.value = "";
-      try { sessionStorage.setItem(ROLE_STORAGE_KEY, role); } catch (e) { /* ignore */ }
-      applyRole(role);
+      try { sessionStorage.setItem(ROLE_STORAGE_KEY, role === "company" ? COMPANY_ROLE_PREFIX + companyId : role); } catch (e) { /* ignore */ }
+      applyRole(role, companyId);
     } finally {
       btn.disabled = false;
       btn.textContent = "Unlock";
     }
   }
 
+  // Opened inside the EMR Tracker (its Batch Book tab), the tracker's own
+  // login is enough — no second password. Only the tracker's main page
+  // counts; Batch Book's own links (including the emr-tracker/batchbook/
+  // shortcut) still ask for the password as usual. Nothing is saved, so
+  // this never unlocks Batch Book anywhere else.
+  function trackerEmbedRole() { return null; } // Vorion is never embedded in another app
+
+
   function lockApp() {
     try { sessionStorage.removeItem(ROLE_STORAGE_KEY); } catch (e) { /* ignore */ }
     state.role = null;
+    state.companyId = "";
     $("#app").hidden = true;
     $("#lock-screen").hidden = false;
     $("#lock-password").value = "";
@@ -949,36 +1316,62 @@
   // Applies role-based visibility: team members can log batches, see
   // stock quantities, and view full Reports (including costs); only
   // Settings (rates, wages, access control) stays admin-only.
-  function applyRole(role) {
+  function applyRole(role, companyId) {
     state.role = role;
-    scheduleProcessingReconcile();
+    state.companyId = role === "company" ? (companyId || "") : "";
     $("#lock-screen").hidden = true;
     $("#app").hidden = false;
 
+    const isCompany = role === "company";
+    const company = isCompany ? jobCompanyById(state.companyId) : null;
     const badge = $("#role-badge");
     const logoutBtn = $("#btn-logout");
     if (badge) {
       badge.hidden = false;
-      badge.textContent = role === "admin" ? "Admin view" : "Team view";
+      badge.textContent = role === "admin" ? "Admin view"
+        : isCompany ? ((company ? company.name : "Company") + " · stock view")
+        : "Team view";
       badge.className = "role-badge" + (role === "admin" ? " admin" : "");
     }
     if (logoutBtn) logoutBtn.hidden = false;
 
     const isTeam = role === "team";
-    const settingsTab = $("#tab-btn-settings");
-    if (settingsTab) settingsTab.hidden = isTeam;
+    // Company logins see only the Stock tab; every other tab is hidden.
+    $all(".tab-btn").forEach((b) => {
+      if (isCompany) b.hidden = b.dataset.tab !== "stock";
+      else b.hidden = (b.dataset.tab === "settings" && isTeam);
+    });
     const costBlock = $("#cost-details-block");
-    if (costBlock) costBlock.hidden = isTeam;
+    if (costBlock) costBlock.hidden = isTeam || isCompany;
+    maybeAutoRecalc();
     // Job work rates can be viewed by anyone, but only admin can add
     // companies/products or change a rate.
     const jwAdminTools = $("#jw-admin-tools");
-    if (jwAdminTools) jwAdminTools.hidden = isTeam;
+    if (jwAdminTools) jwAdminTools.hidden = role !== "admin";
+    // Stock tab: a company can only read its own ledger — no entry form,
+    // no company picker, no company column.
+    const xferCard = $("#xfer-card");
+    if (xferCard) xferCard.hidden = isCompany;
+    const stockForm = $("#stock-entry-card");
+    if (stockForm) stockForm.hidden = isCompany;
+    const coFilter = $("#st-filter-company-field");
+    if (coFilter) coFilter.hidden = isCompany;
+    const coCol = $("#stock-col-company");
+    if (coCol) coCol.hidden = isCompany;
+    const stockIntro = $("#stock-intro");
+    if (stockIntro) {
+      stockIntro.textContent = isCompany
+        ? "Your stock with us: opening stock plus what was produced for you, minus what was dispatched, gives the closing stock. All quantities are in Metric Tonnes (MT)."
+        : "Opening stock plus what was produced, minus what was dispatched, gives the closing stock. All quantities on this page are in Metric Tonnes (MT).";
+    }
 
+    if (isCompany) switchTab("stock");
     // If a team member was mid-way on an admin-only tab (or is being
     // switched down from admin), bounce them back to Log Batch.
-    if (isTeam && ADMIN_ONLY_TABS.indexOf(state.activeTab) !== -1) switchTab("entry");
+    else if (isTeam && ADMIN_ONLY_TABS.indexOf(state.activeTab) !== -1) switchTab("entry");
     renderTodayList();
     renderJobCompanies();
+    renderStock();
   }
 
   // ---------------------------------------------------------------
@@ -986,6 +1379,7 @@
   // ---------------------------------------------------------------
   function switchTab(tab) {
     if (state.role === "team" && ADMIN_ONLY_TABS.indexOf(tab) !== -1) return;
+    if (state.role === "company" && tab !== "stock") return;
     state.activeTab = tab;
     $all(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
     $all(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + tab));
@@ -993,6 +1387,7 @@
     // figure automatically — make sure the ledger reflects the latest
     // entries the moment someone opens the Stock tab.
     if (tab === "stock") renderStock();
+    if (tab === "attendance") renderAttendance();
   }
 
   // ---------------------------------------------------------------
@@ -1095,7 +1490,6 @@
           : "Fallback processing cost for \"" + product.name + "\" set to " + fmtINR(updated.processingCost) + ".",
         "success"
       );
-      scheduleProcessingReconcile();
     } catch (e) {
       toast("Could not save: " + e.message, "error");
     }
@@ -1221,7 +1615,10 @@
     if ($("#f-daylabour-hint")) $("#f-daylabour-hint").hidden = !checked;
     if (checked) {
       const date = $("#f-date") ? $("#f-date").value : todayStr();
-      const existing = await loadDayLabourForDate(date);
+      const factory = $("#f-factory") ? $("#f-factory").value : "";
+      const lbl = $("#f-attendance-title");
+      if (lbl) lbl.textContent = "Attendance today" + (factory ? " at " + factory : "") + " (required)";
+      const existing = factory ? await loadDayLabourForDate(date, factory) : null;
       if ($("#f-daylabour-operators")) $("#f-daylabour-operators").value = existing ? existing.operators : "";
       if ($("#f-daylabour-loadmen")) $("#f-daylabour-loadmen").value = existing ? existing.loadmen : "";
     }
@@ -1240,8 +1637,7 @@
     const mats = getFormMaterialsQty();
     const productId = $("#f-product") ? $("#f-product").value : "";
     const companyId = $("#f-jobwork-company") ? $("#f-jobwork-company").value : "";
-    const formDate = $("#f-date") ? $("#f-date").value : todayStr();
-    const c = computeCosts(mats, outputQty, operators, loadmen, productId, companyId, formDate);
+    const c = computeCosts(mats, outputQty, operators, loadmen, productId, companyId, $("#f-date") ? $("#f-date").value : "", $("#f-factory") ? $("#f-factory").value : "");
     $("#sum-rm").textContent = fmtINR(c.rmCost);
     $("#sum-processing").textContent = fmtINR(c.processingCost);
     // With the shared day crew on (and no product/company labour
@@ -1327,6 +1723,7 @@
 
   async function submitEntry() {
     const date = $("#f-date").value;
+    const factory = $("#f-factory") ? $("#f-factory").value : "";
     const productId = $("#f-product").value;
     // Entered in whichever unit is picked on the form; stored (and
     // costed) as a Kg-equivalent, as before.
@@ -1347,6 +1744,9 @@
     const mats = getFormMaterialsQty();
 
     if (!date) return toast("Pick a date first.", "error");
+    if (!factory) return toast("Pick the factory.", "error");
+    if ($("#f-daylabour-operators") && ($("#f-daylabour-operators").value.trim() === "" || $("#f-daylabour-loadmen").value.trim() === ""))
+      return toast("Enter today's attendance — number of operators and loadmen at " + factory + ".", "error");
     if (!productId) return toast("Pick a product first.", "error");
     if (productId === "__other__") return toast("Finish adding the new product first.", "error");
     if (outputVal <= 0) return toast("Enter the output quantity produced.", "error");
@@ -1363,11 +1763,11 @@
       const enteredRate = rateInp ? Number(rateInp.value) || 0 : 0;
       if (enteredRate <= 0) return toast("Enter the rate agreed for this order first.", "error");
     }
-    const c = computeCosts(mats, outputQty, operators, loadmen, productId, jobworkCompanyId, date);
+    const c = computeCosts(mats, outputQty, operators, loadmen, productId, jobworkCompanyId, date, factory);
     const editingId = state.editingEntryId;
     const existing = editingId ? state.entries.find((e) => e.id === editingId) : null;
     const payload = {
-      date, productId, outputQty, materials: mats, operators, loadmen, remarks,
+      date, factory, productId, outputQty, materials: mats, operators, loadmen, remarks,
       usesDayLabourSplit: useDayLabour,
       rmCost: c.rmCost, processingCost: c.processingCost, labourCost: c.labourCost,
       totalCost: c.totalCost, costPerKg: c.costPerKg,
@@ -1443,12 +1843,10 @@
         const idx = state.entries.findIndex((e) => e.id === savedId);
         if (idx !== -1) state.entries[idx] = merged; else state.entries.unshift(merged);
       }
-      if (useDayLabour) await saveDayLabour(date, dayOperators, dayLoadmen);
-      // This batch's output changes the month's actual MT (and so its ₹/MT
-      // rate) — re-cost the month first, then rebalance the day crew.
-      await recomputeMonthProcessing(monthKeyOf(date));
-      if (existing && existing.date && monthKeyOf(existing.date) !== monthKeyOf(date)) await recomputeMonthProcessing(monthKeyOf(existing.date));
-      await recomputeDayLabourSplit(date);
+      try { localStorage.setItem("bb_last_factory", factory); } catch (e) { /* ignore */ }
+      if (useDayLabour) await saveDayLabour(date, dayOperators, dayLoadmen, factory);
+      await recomputeDayLabourSplit(date, factory);
+      if (isClosedMonth(monthOf(date))) await recalcMonthProcessing(monthOf(date));
       if (!state.db) {
         renderTodayList();
         renderReports();
@@ -1492,7 +1890,7 @@
     if (!sel) return;
     dateVal = dateVal || ($("#f-date") ? $("#f-date").value || todayStr() : todayStr());
     const counts = {};
-    state.entries.forEach((e) => { if (e.date) counts[e.date] = (counts[e.date] || 0) + 1; });
+    state.entries.forEach((e) => { if (e.date && inView(e)) counts[e.date] = (counts[e.date] || 0) + 1; });
     if (!(dateVal in counts)) counts[dateVal] = 0; // list the currently selected date even with 0 batches
     const dates = Object.keys(counts).sort().reverse();
     sel.innerHTML = "";
@@ -1507,8 +1905,8 @@
     const host = $("#today-list");
     const dateVal = $("#f-date") ? $("#f-date").value || todayStr() : todayStr();
     populateDateJump(dateVal);
-    const rows = state.entries.filter((e) => e.date === dateVal);
-    $("#today-list-label").textContent = "Batches logged for " + dateVal +
+    const rows = state.entries.filter((e) => e.date === dateVal && inView(e));
+    $("#today-list-label").textContent = "Batches logged for " + dateVal + (state.viewFactory ? " — " + state.viewFactory : "") +
       (rows.length ? " (" + rows.length + (rows.length === 1 ? " batch" : " batches") + ")" : "");
     host.innerHTML = "";
     if (!rows.length) {
@@ -1564,6 +1962,7 @@
     if (!entry) return;
     opts = opts || {};
     $("#f-product").value = entry.productId || "";
+    if ($("#f-factory") && entry.factory) $("#f-factory").value = entry.factory;
     // entry.outputQty is stored in Kg; refill the form in MT (and reset
     // the unit picker to MT so the displayed number matches the label).
     $("#f-output").value = entry.outputQty ? entry.outputQty / KG_PER_MT : "";
@@ -1584,7 +1983,7 @@
     // otherwise re-saving it while editing would silently drop it out
     // (the checkbox would read as unchecked) even though it was pooled.
     if ($("#f-use-daylabour")) {
-      $("#f-use-daylabour").checked = !!entry.usesDayLabourSplit;
+      $("#f-use-daylabour").checked = true;
       toggleDayLabourUI();
     }
     updateLiveSummary();
@@ -1744,12 +2143,11 @@
         // the rest. Drop it from our local copy first since the realtime
         // listener hasn't come back yet.
         state.entries = state.entries.filter((e) => e.id !== id);
-        if (date) await recomputeMonthProcessing(monthKeyOf(date));
-        if (date) await recomputeDayLabourSplit(date);
+        if (date) await recomputeDayLabourSplit(date, factoryOf(target));
+        if (date && isClosedMonth(monthOf(date))) await recalcMonthProcessing(monthOf(date));
       } else {
         state.entries = state.entries.filter((e) => e.id !== id);
-        if (date) await recomputeMonthProcessing(monthKeyOf(date));
-        if (date) await recomputeDayLabourSplit(date);
+        if (date) await recomputeDayLabourSplit(date, factoryOf(target));
         renderTodayList();
         renderReports();
         // Stock's Produced/Closing figures are computed live from
@@ -1847,6 +2245,14 @@
       state.jobworkCompanies.forEach((c) => stFilterSel.appendChild(el("option", { value: c.id }, [c.name])));
       if (cur) stFilterSel.value = cur;
     }
+    const accessSel = $("#s-company-access-company");
+    if (accessSel) {
+      const cur = accessSel.value;
+      accessSel.innerHTML = "";
+      state.jobworkCompanies.forEach((c) => accessSel.appendChild(el("option", { value: c.id }, [c.name])));
+      if (cur) accessSel.value = cur;
+    }
+    renderCompanyAccessList();
     populateLabourCompanySelect();
   }
 
@@ -1858,6 +2264,7 @@
     const end = $("#jw-rep-end") ? $("#jw-rep-end").value : "";
     const companyId = $("#jw-rep-company") ? $("#jw-rep-company").value : "";
     return state.entries.filter((e) => {
+      if (!inView(e)) return false;
       if (!e.jobworkCompanyId) return false;
       if (start && e.date < start) return false;
       if (end && e.date > end) return false;
@@ -1997,6 +2404,7 @@
     const productId = $("#rep-product") ? $("#rep-product").value : "";
     const companyId = $("#rep-company") ? $("#rep-company").value : "";
     return state.entries.filter((e) => {
+      if (!inView(e)) return false;
       if (start && e.date < start) return false;
       if (end && e.date > end) return false;
       if (productId && e.productId !== productId) return false;
@@ -2005,8 +2413,34 @@
     });
   }
 
+  // Factory-wise statement for the Reports date/product/company filters,
+  // with a consolidated line for both factories together.
+  function renderFactorySummary() {
+    const host = $("#factory-summary");
+    if (!host) return;
+    const saved = state.viewFactory;
+    state.viewFactory = "";
+    const all = filteredEntries();
+    state.viewFactory = saved;
+    const sum = (rows) => {
+      const t = { n: rows.length, kg: 0, rm: 0, proc: 0, lab: 0, tot: 0, jrev: 0 };
+      rows.forEach((e) => {
+        t.kg += Number(e.outputQty) || 0; t.rm += Number(e.rmCost) || 0; t.proc += Number(e.processingCost) || 0;
+        t.lab += Number(e.labourCost) || 0; t.tot += Number(e.totalCost) || 0; t.jrev += Number(e.jobworkRevenue) || 0;
+      });
+      return t;
+    };
+    const money = (v) => "₹" + Math.round(v).toLocaleString("en-IN");
+    const row = (label, t, cls) => '<tr' + (cls ? ' class="' + cls + '"' : '') + '><td>' + label + '</td><td class="num">' + t.n + '</td><td class="num">' + fmtNum(t.kg / KG_PER_MT, 2) + '</td><td class="num">' + money(t.rm) + '</td><td class="num">' + money(t.proc) + '</td><td class="num">' + money(t.lab) + '</td><td class="num strong">' + money(t.tot) + '</td><td class="num">' + (t.kg ? money(t.tot / (t.kg / KG_PER_MT)) : "—") + '</td><td class="num">' + (t.jrev ? money(t.jrev) : "—") + '</td></tr>';
+    let html = '<div class="table-wrap"><table><thead><tr><th>Factory</th><th class="num">Batches</th><th class="num">Output (MT)</th><th class="num">Raw material</th><th class="num">Processing</th><th class="num">Labour</th><th class="num">Total cost</th><th class="num">Cost / MT</th><th class="num">Job-work revenue</th></tr></thead><tbody>';
+    FACTORIES.forEach((f) => { html += row(f, sum(all.filter((e) => factoryOf(e) === f)), state.viewFactory === f ? "fs-current" : ""); });
+    html += row("<strong>Consolidated (both)</strong>", sum(all), "fs-total" + (state.viewFactory ? "" : " fs-current"));
+    host.innerHTML = html + '</tbody></table></div>';
+  }
+
   function renderReports() {
     if (!$("#view-reports")) return;
+    renderFactorySummary();
     const rows = filteredEntries();
 
     const totalBatches = rows.length;
@@ -2242,18 +2676,23 @@
   }
   function stockRowFor(date, productId, companyId) {
     const key = stockKey(companyId);
-    return state.stock.find((s) => s.date === date && s.productId === productId && stockKey(s.companyId) === key) || null;
+    return state.stock.find((s) => !isTransfer(s) && inFactory(s, stockScope) && s.date === date && s.productId === productId && stockKey(s.companyId) === key) || null;
   }
   // All distinct (date, companyId) buckets that exist for a product, from
   // either stock docs or tagged batch entries — used to build the ledger
   // and to find "the most recent prior date" per company.
   function stockBucketsFor(productId) {
     const map = new Map(); // key `${date} ${companyKey}` -> {date, companyId, companyName}
-    state.stock.filter((s) => s.productId === productId).forEach((s) => {
+    // Transfers between factories create a regular-stock bucket on both sides.
+    state.stock.filter((s) => isTransfer(s) && s.productId === productId && (!stockScope || s.fromFactory === stockScope || s.toFactory === stockScope)).forEach((s) => {
+      const key = s.date + " ";
+      if (!map.has(key)) map.set(key, { date: s.date, companyId: "", companyName: "" });
+    });
+    state.stock.filter((s) => !isTransfer(s) && inFactory(s, stockScope) && s.productId === productId).forEach((s) => {
       const key = s.date + " " + stockKey(s.companyId);
       if (!map.has(key)) map.set(key, { date: s.date, companyId: s.companyId || "", companyName: s.companyName || "" });
     });
-    state.entries.filter((e) => e.productId === productId).forEach((e) => {
+    state.entries.filter((e) => inFactory(e, stockScope) && e.productId === productId).forEach((e) => {
       const companyId = e.jobworkCompanyId || "";
       const key = e.date + " " + stockKey(companyId);
       if (!map.has(key)) {
@@ -2293,6 +2732,8 @@
   }
 
   function openingFor(date, productId, companyId) {
+    const counted = countFor(date, productId, companyId);
+    if (counted != null) return counted;
     const priorDate = priorDateFor(productId, date, companyId);
     if (priorDate) {
       // A prior day exists for this bucket — opening is ALWAYS derived
@@ -2309,10 +2750,43 @@
     const row = stockRowFor(date, productId, companyId);
     return row ? Number(row.opening) || 0 : 0;
   }
+  // A physical stock count saved for the day replaces the worked-out
+  // closing; the next day carries on from the counted figure.
+  // Stock physically counted at the START of a day becomes that day's
+  // opening; the day's production, transfers and dispatches move it as
+  // usual. The adjustment (count minus the carried-forward figure) is
+  // worked out live, so it shrinks by itself as older dispatches are
+  // filled in.
+  function countFor(date, productId, companyId) {
+    const row = stockRowFor(date, productId, companyId);
+    if (!row) return null;
+    const v = row.countedOpening != null && row.countedOpening !== "" ? row.countedOpening : null;
+    return v == null ? null : Number(v);
+  }
+  function carriedOpeningFor(date, productId, companyId) {
+    const priorDate = priorDateFor(productId, date, companyId);
+    return priorDate ? closingFor(priorDate, productId, companyId) : 0;
+  }
+  function countAdjustmentFor(date, productId, companyId) {
+    const c = countFor(date, productId, companyId);
+    return c == null ? 0 : c - carriedOpeningFor(date, productId, companyId);
+  }
   function closingFor(date, productId, companyId) {
     const opening = openingFor(date, productId, companyId);
     const producedMT = producedFor(date, productId, companyId) / KG_PER_MT;
-    return opening + producedMT - dispatchedFor(date, productId, companyId);
+    return opening + producedMT + transferNetFor(date, productId, companyId) - dispatchedFor(date, productId, companyId);
+  }
+  function isTransfer(s) { return s && s.kind === "transfer"; }
+  // MT moved into (+) or out of (−) the factory in stockScope on this day.
+  // Transfers only move regular stock, never a job-work company's stock.
+  function transferNetFor(date, productId, companyId) {
+    if (companyId || !stockScope) return 0;
+    return state.stock.filter((s) => isTransfer(s) && s.date === date && s.productId === productId).reduce((a, s) => {
+      const q = Number(s.qty) || 0;
+      if (s.toFactory === stockScope) a += q;
+      if (s.fromFactory === stockScope) a -= q;
+      return a;
+    }, 0);
   }
 
   function suggestOpening(productId, date, companyId) {
@@ -2329,11 +2803,16 @@
   function producedFor(date, productId, companyId) {
     const key = stockKey(companyId);
     return state.entries
-      .filter((e) => e.date === date && e.productId === productId && stockKey(e.jobworkCompanyId) === key)
+      .filter((e) => inFactory(e, stockScope) && e.date === date && e.productId === productId && stockKey(e.jobworkCompanyId) === key)
       .reduce((s, e) => s + (e.outputQty || 0), 0);
   }
 
-  function stockAutofillOpening() {
+  // The stock form works on the factory picked in its own Factory box.
+  function stockFormFactory() { return ($("#st-factory") && $("#st-factory").value) || "Plant"; }
+  function withScope(f, fn) { const prev = stockScope; stockScope = f; try { return fn(); } finally { stockScope = prev; } }
+
+  function stockAutofillOpening() { return withScope(stockFormFactory(), stockAutofillOpeningInner); }
+  function stockAutofillOpeningInner() {
     const productId = $("#st-product").value;
     const date = $("#st-date").value;
     const companyId = $("#st-company") ? $("#st-company").value : "";
@@ -2361,6 +2840,7 @@
       }
     }
     $("#st-dispatched").value = existing ? existing.dispatched : "";
+    if ($("#st-count")) $("#st-count").value = existing && existing.countedOpening != null ? existing.countedOpening : "";
     updateStockClosingPreview();
   }
 
@@ -2369,7 +2849,8 @@
   // on a bucket's day one where it's still editable) so the person can
   // see the remaining balance immediately, without changing what
   // "Opening stock" itself means or saving anything yet.
-  function updateStockClosingPreview() {
+  function updateStockClosingPreview() { return withScope(stockFormFactory(), updateStockClosingPreviewInner); }
+  function updateStockClosingPreviewInner() {
     const preview = $("#st-closing-preview");
     if (!preview) return;
     const productId = $("#st-product").value;
@@ -2379,13 +2860,19 @@
       preview.hidden = true;
       return;
     }
-    const opening = parseFloat($("#st-opening").value) || 0;
+    const countRawP = $("#st-count") ? $("#st-count").value.trim() : "";
+    const opening = countRawP !== "" ? (parseFloat(countRawP) || 0) : (parseFloat($("#st-opening").value) || 0);
     const dispatched = parseFloat($("#st-dispatched").value) || 0;
     const producedMT = producedFor(date, productId, companyId) / KG_PER_MT;
-    const closing = opening + producedMT - dispatched;
+    const xfer = transferNetFor(date, productId, companyId);
+    const closing = opening + producedMT + xfer - dispatched;
     preview.hidden = false;
     preview.textContent = "Closing stock after this: " + fmtNum(closing, 2) + " MT" +
-      (producedMT ? " (" + fmtNum(opening, 2) + " opening + " + fmtNum(producedMT, 2) + " produced − " + fmtNum(dispatched, 2) + " dispatched)" : "");
+      ((producedMT || xfer) ? " (" + fmtNum(opening, 2) + " opening + " + fmtNum(producedMT, 2) + " produced" + (xfer ? (xfer > 0 ? " + " : " − ") + fmtNum(Math.abs(xfer), 2) + " transferred " + (xfer > 0 ? "in" : "out") : "") + " − " + fmtNum(dispatched, 2) + " dispatched)" : "");
+    if (countRawP !== "") {
+      const carried = carriedOpeningFor(date, productId, companyId), adj = opening - carried;
+      preview.textContent += " — starts from the count of " + fmtNum(opening, 2) + " MT (carried forward was " + fmtNum(carried, 2) + " MT, adjustment " + (adj >= 0 ? "+" : "−") + fmtNum(Math.abs(adj), 2) + " MT).";
+    }
   }
 
   async function submitStock() {
@@ -2395,8 +2882,11 @@
     const dispatched = parseFloat($("#st-dispatched").value) || 0;
     const opening = parseFloat($("#st-opening").value) || 0;
     if (!productId || !date) return toast("Pick a product and date.", "error");
-    const docId = date + "_" + productId + (companyId ? "_" + companyId : "");
-    const payload = { date, productId, dispatched, opening, updatedAt: new Date().toISOString() };
+    const factory = stockFormFactory();
+    // Orathur keeps the original document ids so its existing stock history carries on.
+    const docId = date + "_" + productId + (companyId ? "_" + companyId : "") + (factory === "Plant" ? "" : "_" + factory);
+    const countRaw = $("#st-count") ? $("#st-count").value.trim() : "";
+    const payload = { date, productId, dispatched, opening, factory, countedOpening: countRaw === "" ? null : (parseFloat(countRaw) || 0), updatedAt: new Date().toISOString() };
     let companyName = "";
     if (companyId) {
       const company = jobCompanyById(companyId);
@@ -2413,7 +2903,7 @@
         state.stock.unshift(payload);
       }
       toast(
-        "Stock entry saved for " + productName(productId) + " on " + date +
+        "Stock entry saved for " + productName(productId) + " (" + factory + ") on " + date +
           (companyId ? " — " + companyName : ""),
         "success"
       );
@@ -2425,19 +2915,38 @@
 
   function renderStock() {
     if (!$("#view-stock")) return;
+    renderTransfers();
     const body = $("#stock-body");
     body.innerHTML = "";
-    const filterCompany = $("#st-filter-company") ? $("#st-filter-company").value : "";
+    const isCompany = state.role === "company";
+    // A company login is always pinned to its own company — whatever the
+    // (hidden) company filter says. With no company id, show nothing.
+    const filterCompany = isCompany
+      ? (state.companyId || "__none__")
+      : ($("#st-filter-company") ? $("#st-filter-company").value : "");
     const filterProduct = $("#st-filter-product") ? $("#st-filter-product").value : "";
 
     // Build the full set of (date, product, company) buckets that have
     // either an explicit Stock doc or batch production tagged to them, so
     // logging a company-tagged batch shows up here immediately even
     // before anyone manually enters a Dispatched figure for it.
-    let buckets = [];
-    state.products.forEach((p) => {
-      stockBucketsFor(p.id).forEach((b) => buckets.push({ productId: p.id, date: b.date, companyId: b.companyId, companyName: b.companyName }));
+    // One factory picked → its own ledger. Both → each factory's ledger
+    // is worked out separately and the figures are added together.
+    const scopes = state.viewFactory ? [state.viewFactory] : FACTORIES.slice();
+    const bucketMap = new Map();
+    scopes.forEach((f) => {
+      stockScope = f;
+      state.products.forEach((p) => {
+        stockBucketsFor(p.id).forEach((b) => {
+          const k = b.date + "|" + p.id + "|" + stockKey(b.companyId);
+          if (!bucketMap.has(k)) bucketMap.set(k, { productId: p.id, date: b.date, companyId: b.companyId, companyName: b.companyName });
+        });
+      });
     });
+    stockScope = state.viewFactory;
+    let buckets = Array.from(bucketMap.values());
+    const sumScopes = (fn) => scopes.reduce((a, f) => { stockScope = f; const v = fn(); stockScope = state.viewFactory; return a + v; }, 0);
+    if (isCompany) buckets = buckets.filter((b) => b.companyId === filterCompany);
 
     // Date filter dropdown — every distinct date that has a stock bucket
     // for ANY company/product, newest first, independent of whichever
@@ -2459,26 +2968,32 @@
     if (filterProduct) buckets = buckets.filter((b) => b.productId === filterProduct);
     buckets = buckets.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)).slice(0, 200);
     if (!buckets.length) {
-      body.appendChild(el("tr", {}, [el("td", { colspan: "8", class: "empty-hint" }, ["No stock entries yet."])]));
+      body.appendChild(el("tr", {}, [el("td", { colspan: isCompany ? "8" : "9", class: "empty-hint" }, ["No stock entries yet."])]));
       return;
     }
     buckets.forEach((b) => {
-      const opening = openingFor(b.date, b.productId, b.companyId);
-      const producedMT = producedFor(b.date, b.productId, b.companyId) / KG_PER_MT;
-      const dispatched = dispatchedFor(b.date, b.productId, b.companyId);
-      const closing = closingFor(b.date, b.productId, b.companyId);
+      const opening = sumScopes(() => openingFor(b.date, b.productId, b.companyId));
+      const producedMT = sumScopes(() => producedFor(b.date, b.productId, b.companyId)) / KG_PER_MT;
+      const dispatched = sumScopes(() => dispatchedFor(b.date, b.productId, b.companyId));
+      const transfers = sumScopes(() => transferNetFor(b.date, b.productId, b.companyId));
+      const closing = sumScopes(() => closingFor(b.date, b.productId, b.companyId));
+      const adj = sumScopes(() => countAdjustmentFor(b.date, b.productId, b.companyId));
+      const counted = scopes.some((f) => { stockScope = f; const c = countFor(b.date, b.productId, b.companyId); stockScope = state.viewFactory; return c != null; });
       // Only a bucket backed by an actual saved Stock doc (an opening
       // override or a manually-entered dispatch) can be deleted — a
       // bucket that exists purely because a batch was tagged here has no
       // doc of its own; delete the batch itself (Log Batch or Reports)
       // to remove that instead.
-      const existingDoc = stockRowFor(b.date, b.productId, b.companyId);
+      const existingDoc = (isCompany || !state.viewFactory) ? null : stockRowFor(b.date, b.productId, b.companyId);
+      const companyCell = el("td", {}, [b.companyId ? (b.companyName || b.companyId) : "—"]);
+      if (isCompany) companyCell.hidden = true;
       body.appendChild(el("tr", {}, [
         el("td", {}, [b.date]),
         el("td", {}, [productName(b.productId)]),
-        el("td", {}, [b.companyId ? (b.companyName || b.companyId) : "—"]),
-        el("td", { class: "num" }, [fmtNum(opening, 2)]),
+        companyCell,
+        el("td", { class: "num" }, [fmtNum(opening, 2), counted ? el("div", { class: "hint", title: "Stock counted at the start of this day. Adjustment = counted minus the figure carried forward (dispatches or losses not entered yet). It shrinks as older entries are filled in." }, ["counted" + (Math.abs(adj) >= 0.005 ? " · adj " + (adj > 0 ? "+" : "−") + fmtNum(Math.abs(adj), 2) : " · matches")]) : null]),
         el("td", { class: "num" }, [fmtNum(producedMT, 2)]),
+        el("td", { class: "num" }, [transfers ? (transfers > 0 ? "+" : "−") + fmtNum(Math.abs(transfers), 2) : "—"]),
         el("td", { class: "num" }, [fmtNum(dispatched, 2)]),
         el("td", { class: "num strong" }, [fmtNum(closing, 2)]),
         el("td", { class: "num" }, [
@@ -2491,6 +3006,65 @@
         ]),
       ]));
     });
+  }
+
+  // ---------- Transfers between factories ----------
+  function renderTransfers() {
+    const body = $("#xfer-body");
+    if (!body) return;
+    const itemSel = $("#xf-item");
+    if (itemSel && itemSel.dataset.n !== String(state.products.length)) {
+      const keep = itemSel.value;
+      itemSel.innerHTML = '<option value="">Pick a product…</option>' + state.products.map((p) => '<option value="' + p.id + '">' + p.name + '</option>').join("") + '<option value="__other__">Other item (raw material, cylinder…)</option>';
+      itemSel.value = keep;
+      itemSel.dataset.n = String(state.products.length);
+    }
+    const rows = state.stock.filter(isTransfer).filter((t) => !state.viewFactory || t.fromFactory === state.viewFactory || t.toFactory === state.viewFactory)
+      .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    body.innerHTML = "";
+    if (!rows.length) { body.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "empty-hint" }, ["No transfers yet."])])); return; }
+    rows.forEach((t) => {
+      body.appendChild(el("tr", {}, [
+        el("td", {}, [t.date]),
+        el("td", {}, [t.fromFactory + " → " + t.toFactory]),
+        el("td", {}, [t.productId ? productName(t.productId) : (t.itemName || "")]),
+        el("td", { class: "num" }, [fmtNum(t.qty, 2) + " " + (t.unit || "MT")]),
+        el("td", {}, [t.productId ? "Stock ledger" : "Note only", t.note ? el("div", { class: "hint" }, [t.note]) : null]),
+        el("td", { class: "num" }, [state.role === "admin" ? el("button", { class: "icon-btn danger", title: "Delete this transfer", onclick: () => deleteTransfer(t.id) }, ["✕"]) : ""]),
+      ]));
+    });
+  }
+  function toggleXferOther() {
+    const other = $("#xf-item") && $("#xf-item").value === "__other__";
+    $all(".xf-other").forEach((e) => { e.hidden = !other; });
+    if ($("#xf-unit")) { if (!other) $("#xf-unit").value = "MT"; $("#xf-unit").disabled = !other; }
+  }
+  async function submitTransfer() {
+    const date = $("#xf-date").value, from = $("#xf-from").value, to = $("#xf-to").value, item = $("#xf-item").value;
+    const qty = parseFloat($("#xf-qty").value) || 0, note = $("#xf-note").value.trim();
+    if (!date) return toast("Pick the date.", "error");
+    if (from === to) return toast("From and To must be different factories.", "error");
+    if (!item) return toast("Pick what was transferred.", "error");
+    if (qty <= 0) return toast("Enter the quantity.", "error");
+    const isOther = item === "__other__";
+    const itemName = isOther ? $("#xf-other-name").value.trim() : "";
+    if (isOther && !itemName) return toast("Type the item name.", "error");
+    const payload = { kind: "transfer", date, fromFactory: from, toFactory: to, productId: isOther ? "" : item, itemName, qty, unit: isOther ? ($("#xf-unit").value.trim() || "nos") : "MT", note, createdAt: new Date().toISOString() };
+    const id = "xfer_" + date + "_" + Date.now();
+    try {
+      if (state.db) await state.db.collection("stock").doc(id).set(payload);
+      else { payload.id = id; state.stock.unshift(payload); renderStock(); renderTransfers(); }
+      toast("Transfer saved: " + fmtNum(qty, 2) + " " + payload.unit + " " + (isOther ? itemName : productName(item)) + ", " + from + " → " + to + ".", "success");
+      $("#xf-qty").value = ""; $("#xf-note").value = ""; if ($("#xf-other-name")) $("#xf-other-name").value = "";
+    } catch (e) { toast("Could not save transfer: " + e.message, "error"); }
+  }
+  async function deleteTransfer(id) {
+    if (!confirm("Delete this transfer? Both factories' stock will be recalculated.")) return;
+    try {
+      if (state.db) await state.db.collection("stock").doc(id).delete();
+      else { state.stock = state.stock.filter((s) => s.id !== id); renderStock(); renderTransfers(); }
+      toast("Transfer deleted.", "warn");
+    } catch (e) { toast("Could not delete: " + e.message, "error"); }
   }
 
   async function deleteStockEntry(id, bucket) {
@@ -2547,112 +3121,125 @@
     });
   }
 
-  const BREAKDOWN_INPUT_IDS = {
-    ebCost: "s-eb-cost", fuelCost: "s-fuel-cost", maintenanceCost: "s-maintenance-cost",
-    electricalMaintenanceCost: "s-electrical-maintenance-cost", stitchingExpense: "s-stitching-expense",
-    sackExpenses: "s-sack-expenses", departmentExpenses: "s-department-expenses", staffSalaries: "s-staff-salaries",
-  };
-
-  function selectedBreakdownMonth() {
-    const inp = $("#s-proc-month");
-    if (inp && !inp.value) inp.value = todayStr().slice(0, 7);
-    return inp ? inp.value : todayStr().slice(0, 7);
-  }
-
-  function prevMonthKey(month) {
-    const [y, m] = month.split("-").map(Number);
-    const d = new Date(y, m - 2, 1);
-    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
-  }
-
-  function monthLabel(month) {
-    const [y, m] = month.split("-").map(Number);
-    return new Date(y, m - 1, 1).toLocaleDateString("en-IN", { month: "short", year: "numeric" });
-  }
-
-  // Fills the breakdown boxes with the picked month's saved figures
-  // (blank if that month hasn't been entered yet).
-  function loadBreakdownMonth() {
-    const month = selectedBreakdownMonth();
-    const mb = monthBreakdown(month);
-    Object.keys(BREAKDOWN_INPUT_IDS).forEach((k) => {
-      const inp = $("#" + BREAKDOWN_INPUT_IDS[k]);
-      if (inp) inp.value = mb && mb[k] ? mb[k] : "";
+  function renderSettingsLabour() {
+    renderFloatingRates();
+    if ($("#s-operator-rate")) $("#s-operator-rate").value = state.labour.operatorRate;
+    if ($("#s-loadman-rate")) $("#s-loadman-rate").value = state.labour.loadmanRate;
+    if ($("#s-vkd-operator-rate")) $("#s-vkd-operator-rate").value = state.labour.vkdOperatorRate != null ? state.labour.vkdOperatorRate : "";
+    if ($("#s-vkd-loadman-rate")) $("#s-vkd-loadman-rate").value = state.labour.vkdLoadmanRate != null ? state.labour.vkdLoadmanRate : "";
+    if ($("#s-processing-cost")) $("#s-processing-cost").value = state.labour.processingCost;
+    const fieldIds = {
+      ebCost: "s-eb-cost", fuelCost: "s-fuel-cost", maintenanceCost: "s-maintenance-cost",
+      electricalMaintenanceCost: "s-electrical-maintenance-cost", stitchingExpense: "s-stitching-expense",
+      sackExpenses: "s-sack-expenses", departmentExpenses: "s-department-expenses", staffSalaries: "s-staff-salaries",
+    };
+    Object.keys(fieldIds).forEach((k) => {
+      const inp = $("#" + fieldIds[k]);
+      if (inp) inp.value = state.labour[k] || "";
     });
-    if ($("#s-budgeted-output-mt")) $("#s-budgeted-output-mt").value = mb && mb.budgetedMonthlyOutputMT ? mb.budgetedMonthlyOutputMT : "";
-    if ($("#s-use-actual-output")) $("#s-use-actual-output").checked = !mb || mb.useActualOutput !== false;
-    if ($("#proc-month-status")) {
-      $("#proc-month-status").textContent = mb
-        ? "Saved figures for " + monthLabel(month) + "."
-        : "Nothing entered for " + monthLabel(month) + " yet — its batches use the default rate. Enter the figures, or copy last month's.";
-    }
+    if ($("#s-budgeted-output-mt")) $("#s-budgeted-output-mt").value = state.labour.budgetedMonthlyOutputMT || "";
     updateProcessingBreakdownReadout();
   }
 
-  function readBreakdownDraft() {
-    const draft = {};
-    Object.keys(BREAKDOWN_INPUT_IDS).forEach((k) => { draft[k] = parseFloat($("#" + BREAKDOWN_INPUT_IDS[k]).value) || 0; });
-    draft.budgetedMonthlyOutputMT = parseFloat($("#s-budgeted-output-mt").value) || 0;
-    draft.useActualOutput = $("#s-use-actual-output") ? $("#s-use-actual-output").checked : true;
-    return draft;
-  }
-
-  function renderSettingsLabour() {
-    if ($("#s-operator-rate")) $("#s-operator-rate").value = state.labour.operatorRate;
-    if ($("#s-loadman-rate")) $("#s-loadman-rate").value = state.labour.loadmanRate;
-    if ($("#s-processing-cost")) $("#s-processing-cost").value = state.labour.processingCost;
-    loadBreakdownMonth();
-    renderMonthlyProcessingHistory();
-  }
-
   // Reads the breakdown fields live (before saving) and updates the
-  // readout under them for the picked month.
+  // "Monthly total" / "Rate applied per batch" readout under them.
   function updateProcessingBreakdownReadout() {
     const totalEl = $("#proc-monthly-total");
     const rateEl = $("#proc-per-mt-rate");
-    if (!totalEl || !rateEl || !$("#s-eb-cost")) return;
-    const month = selectedBreakdownMonth();
-    const draft = readBreakdownDraft();
+    if (!totalEl || !rateEl) return;
+    const draft = {
+      ebCost: $("#s-eb-cost").value, fuelCost: $("#s-fuel-cost").value,
+      maintenanceCost: $("#s-maintenance-cost").value, electricalMaintenanceCost: $("#s-electrical-maintenance-cost").value,
+      stitchingExpense: $("#s-stitching-expense").value, sackExpenses: $("#s-sack-expenses").value,
+      departmentExpenses: $("#s-department-expenses").value, staffSalaries: $("#s-staff-salaries").value,
+      budgetedMonthlyOutputMT: $("#s-budgeted-output-mt").value,
+    };
     const total = monthlyProcessingCostTotal(draft);
     totalEl.textContent = fmtINR(total);
-    const actual = actualOutputMTForMonth(month);
-    if ($("#proc-actual-mt")) $("#proc-actual-mt").textContent = fmtNum(actual, 2) + " MT";
-    const basis = monthOutputBasis(draft, month);
-    rateEl.textContent = basis.mt > 0
-      ? fmtINR(total / basis.mt) + " / MT (" + (basis.source === "actual" ? "on actual output" : "on budgeted output") + ")"
-      : "Needs output — log batches this month or enter a budgeted MT";
+    const outEl = $("#proc-auto-output");
+    const outs = [], rates = [];
+    FACTORIES.forEach((f) => {
+      const last = lastClosedMonthFor(f);
+      if (last) outs.push(f + " " + fmtNum(last.mt, 1) + " MT (" + monthLabelShort(last.month) + ")");
+      const r = runningRateFor(f);
+      if (r) rates.push(f + " " + fmtINR(r.rate) + " / MT");
+    });
+    if (outEl) outEl.textContent = outs.length ? outs.join(" · ") : "No finished month yet";
+    const perMT = processingCostPerMT(draft);
+    rateEl.textContent = rates.length ? rates.join(" · ")
+      : perMT != null ? fmtINR(perMT) + " / MT" : "Not set up — using fallback";
   }
 
-  // Month-by-month history table under the breakdown.
-  function renderMonthlyProcessingHistory() {
-    const body = $("#proc-history-body");
-    if (!body) return;
-    const months = (state.labour && state.labour.months) || {};
-    const keys = Object.keys(months).sort().reverse();
-    body.innerHTML = "";
-    if (!keys.length) {
-      body.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "muted" }, ["No months entered yet."])]));
-      return;
-    }
-    keys.forEach((k) => {
-      const mb = months[k];
-      const total = monthlyProcessingCostTotal(mb);
-      const basis = monthOutputBasis(mb, k);
-      const power = (Number(mb.ebCost) || 0) + (Number(mb.fuelCost) || 0);
-      const maint = (Number(mb.maintenanceCost) || 0) + (Number(mb.electricalMaintenanceCost) || 0);
-      const tr = el("tr", {}, [
-        el("td", {}, [monthLabel(k)]),
-        el("td", { class: "num" }, [fmtINR(power)]),
-        el("td", { class: "num" }, [fmtINR(maint)]),
-        el("td", { class: "num" }, [fmtINR(total - power - maint)]),
-        el("td", { class: "num" }, [fmtINR(total)]),
-        el("td", { class: "num" }, [basis.mt > 0 ? fmtNum(basis.mt, 2) + (basis.source === "budget" ? " (budget)" : "") : "—"]),
-        el("td", { class: "num" }, [basis.mt > 0 ? fmtINR(total / basis.mt) : "—"]),
-      ]);
-      tr.style.cursor = "pointer";
-      tr.addEventListener("click", () => { $("#s-proc-month").value = k; loadBreakdownMonth(); });
-      body.appendChild(tr);
+  function renderFloatingRates() {
+    // Monthly output / running rate readout follows the batches too.
+    if ($("#proc-auto-output")) { try { updateProcessingBreakdownReadout(); } catch (e) { /* ignore */ } }
+    const wrap = $("#float-rates-wrap");
+    if (!wrap) return;
+    const months = Array.from(new Set(state.entries.map((e) => monthOf(e.date)))).filter((m) => /^\d{4}-\d{2}$/.test(m)).sort().reverse();
+    if (!months.length) { wrap.innerHTML = '<p class="hint">No batches yet.</p>'; return; }
+    const tag = { bills: "", manual: " ✎", budget: " *" };
+    const money = (v) => "₹" + Math.round(Number(v) || 0).toLocaleString("en-IN");
+    let html = '<div class="table-wrap"><table><thead><tr><th>Month</th><th>Factory</th><th class="num">Output (MT)</th><th class="num">Rate / MT</th><th class="num">Total</th>' +
+      PROCESSING_BREAKDOWN_FIELDS.map((k) => '<th class="num">' + PROCESSING_FIELD_LABELS[k] + '</th>').join("") +
+      '</tr></thead><tbody>';
+    const budgetRate = processingCostPerMT(state.labour);
+    const runningCell = (f) => {
+      const r = runningRateFor(f || "Plant");
+      if (r) return money(r.rate) + ' <span class="hint">' + monthLabelShort(r.month) + ' actual</span>';
+      return budgetRate != null ? money(budgetRate) + ' <span class="hint">budget</span>' : "—";
+    };
+    months.forEach((m) => {
+      const rows = state.entries.filter((e) => monthOf(e.date) === m);
+      const monthKg = rows.reduce((a, e) => a + (Number(e.outputQty) || 0), 0);
+      const closed = isClosedMonth(m);
+      const label = new Date(m + "-01T00:00:00").toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+      const groups = monthGroups(rows);
+      const untagged = rows.filter((e) => FACTORIES.indexOf(e.factory) === -1).length;
+      groups.forEach((g, gi) => {
+        const kg = g.rows.reduce((a, e) => a + (Number(e.outputQty) || 0), 0);
+        const share = g.factory && monthKg > 0 ? kg / monthKg : 1;
+        const a = monthProcessingActuals(m, g.factory, share);
+        const rate = closed ? groupRate(m, g, monthKg) : null;
+        const fname = g.factory || ('Both' + (untagged ? ' <span class="hint">(' + untagged + ' untagged)</span>' : ''));
+        html += '<tr><td>' + (gi === 0 ? label + (closed ? "" : ' <span class="hint">(running)</span>') : "") + '</td><td>' + fname + '</td><td class="num">' + fmtNum(kg / KG_PER_MT, 1) + '</td>' +
+          '<td class="num"><strong>' + (closed ? (rate != null ? money(rate) : "—") : runningCell(g.factory)) + '</strong></td>' +
+          '<td class="num"><strong>' + money(a.total) + '</strong></td>' +
+          PROCESSING_BREAKDOWN_FIELDS.map((k) => {
+            const f = a.fields[k];
+            return '<td class="num"' + (f.source === "budget" ? ' style="opacity:.6"' : '') + '>' + money(f.amount) + tag[f.source] + '</td>';
+          }).join("") + '</tr>';
+      });
     });
+    html += '</tbody></table></div><p class="hint" style="margin-top:6px;">✎ = typed in below &middot; * (faded) = monthly budget, split by each factory&rsquo;s share of output, used because no bill is logged for that head yet. A month is costed per factory once every batch in it is tagged with a factory.</p>';
+    wrap.innerHTML = html;
+    const ms = $("#float-month");
+    if (ms) {
+      const keep = ms.value;
+      ms.innerHTML = months.filter(isClosedMonth).map((m) => '<option value="' + m + '">' + new Date(m + "-01T00:00:00").toLocaleDateString("en-IN", { month: "short", year: "numeric" }) + '</option>').join("");
+      if (keep) ms.value = keep;
+    }
+    const hs = $("#float-head");
+    if (hs && !hs.options.length) hs.innerHTML = PROCESSING_BREAKDOWN_FIELDS.map((k) => '<option value="' + k + '">' + PROCESSING_FIELD_LABELS[k] + '</option>').join("");
+  }
+
+  async function saveFloatingManual() {
+    const m = $("#float-month").value, k = $("#float-head").value, raw = $("#float-amount").value.trim();
+    const factory = $("#float-factory") ? $("#float-factory").value : "";
+    if (!m || !k) return;
+    const key = manualKey(m, factory);
+    const months = JSON.parse(JSON.stringify(state.processingMonths || {}));
+    months[key] = months[key] || {};
+    if (raw === "") delete months[key][k]; else months[key][k] = parseFloat(raw) || 0;
+    try {
+      if (state.db) await state.db.doc("settings/processingMonths").set({ months, updatedAt: new Date().toISOString() });
+      state.processingMonths = months;
+      $("#float-amount").value = "";
+      toast(raw === "" ? "Cleared — that month now uses bills or budget for " + PROCESSING_FIELD_LABELS[k] + "." : PROCESSING_FIELD_LABELS[k] + " saved for " + (factory || "both factories") + ".", "success");
+      renderFloatingRates();
+      await recalcMonthProcessing(m);
+    } catch (e) {
+      toast("Could not save: " + e.message, "error");
+    }
   }
 
   async function saveMaterialRates() {
@@ -2678,6 +3265,8 @@
     const payload = Object.assign({}, state.labour, {
       operatorRate: parseFloat($("#s-operator-rate").value) || 0,
       loadmanRate: parseFloat($("#s-loadman-rate").value) || 0,
+      vkdOperatorRate: $("#s-vkd-operator-rate") && $("#s-vkd-operator-rate").value !== "" ? parseFloat($("#s-vkd-operator-rate").value) || 0 : null,
+      vkdLoadmanRate: $("#s-vkd-loadman-rate") && $("#s-vkd-loadman-rate").value !== "" ? parseFloat($("#s-vkd-loadman-rate").value) || 0 : null,
       processingCost: parseFloat($("#s-processing-cost").value) || 0,
     });
     state.labour = payload;
@@ -2685,59 +3274,41 @@
       if (state.db) await state.db.doc("settings/labour").set(payload);
       toast("Labour & processing settings saved.", "success");
       updateLiveSummary();
-      scheduleProcessingReconcile();
     } catch (e) {
       toast("Could not save settings: " + e.message, "error");
     }
   }
 
   async function saveProcessingBreakdown() {
-    const month = selectedBreakdownMonth();
-    if (!month) return toast("Pick a month first.", "error");
-    const months = Object.assign({}, state.labour.months || {});
-    months[month] = Object.assign(readBreakdownDraft(), { updatedAt: new Date().toISOString() });
-    const payload = Object.assign({}, state.labour, { months });
+    const payload = Object.assign({}, state.labour, {
+      ebCost: parseFloat($("#s-eb-cost").value) || 0,
+      fuelCost: parseFloat($("#s-fuel-cost").value) || 0,
+      maintenanceCost: parseFloat($("#s-maintenance-cost").value) || 0,
+      electricalMaintenanceCost: parseFloat($("#s-electrical-maintenance-cost").value) || 0,
+      stitchingExpense: parseFloat($("#s-stitching-expense").value) || 0,
+      sackExpenses: parseFloat($("#s-sack-expenses").value) || 0,
+      departmentExpenses: parseFloat($("#s-department-expenses").value) || 0,
+      staffSalaries: parseFloat($("#s-staff-salaries").value) || 0,
+      budgetedMonthlyOutputMT: parseFloat($("#s-budgeted-output-mt").value) || 0,
+    });
+    // Keep the "Fallback processing cost per batch" field in sync with the
+    // breakdown's computed ₹/MT rate, so the two never show conflicting
+    // numbers (per-batch cost is always calculated in MT via this rate —
+    // see processingCostPerMT/computeCosts — the fallback is just the
+    // number that's also stored/shown so nothing looks out of date).
+    const perMT = processingCostPerMT(payload);
+    if (perMT != null) {
+      payload.processingCost = Math.round(perMT * 100) / 100;
+      if ($("#s-processing-cost")) $("#s-processing-cost").value = payload.processingCost;
+    }
     state.labour = payload;
     try {
       if (state.db) await state.db.doc("settings/labour").set(payload);
-      const changed = await recomputeMonthProcessing(month);
-      const rate = processingRateForDate(month + "-01");
-      toast("Saved " + monthLabel(month) + (rate != null ? " — " + fmtINR(rate) + "/MT" : "") +
-        (changed ? ", " + changed + " batch" + (changed === 1 ? "" : "es") + " re-costed." : "."), "success");
-      loadBreakdownMonth();
-      renderMonthlyProcessingHistory();
+      toast("Processing cost breakdown saved" + (perMT != null ? " — fallback field updated to " + fmtINR(payload.processingCost) + "/MT." : "."), "success");
+      updateProcessingBreakdownReadout();
       updateLiveSummary();
     } catch (e) {
       toast("Could not save breakdown: " + e.message, "error");
-    }
-  }
-
-  function copyPreviousMonthBreakdown() {
-    const month = selectedBreakdownMonth();
-    const prev = monthBreakdown(prevMonthKey(month));
-    if (!prev) return toast("No figures saved for " + monthLabel(prevMonthKey(month)) + " to copy.", "warn");
-    Object.keys(BREAKDOWN_INPUT_IDS).forEach((k) => { $("#" + BREAKDOWN_INPUT_IDS[k]).value = prev[k] || ""; });
-    $("#s-budgeted-output-mt").value = prev.budgetedMonthlyOutputMT || "";
-    $("#s-use-actual-output").checked = prev.useActualOutput !== false;
-    updateProcessingBreakdownReadout();
-    toast("Copied " + monthLabel(prevMonthKey(month)) + " — change what's different and Save.", "success");
-  }
-
-  async function deleteBreakdownMonth() {
-    const month = selectedBreakdownMonth();
-    if (!monthBreakdown(month)) return toast("Nothing saved for " + monthLabel(month) + ".", "warn");
-    if (!confirm("Remove the " + monthLabel(month) + " breakdown? Its batches go back to the default rate.")) return;
-    const months = Object.assign({}, state.labour.months || {});
-    delete months[month];
-    state.labour = Object.assign({}, state.labour, { months });
-    try {
-      if (state.db) await state.db.doc("settings/labour").set(state.labour);
-      await recomputeMonthProcessing(month);
-      toast(monthLabel(month) + " breakdown removed.", "warn");
-      loadBreakdownMonth();
-      renderMonthlyProcessingHistory();
-    } catch (e) {
-      toast("Could not remove: " + e.message, "error");
     }
   }
 
@@ -2760,6 +3331,66 @@
   }
 
   // ---------------------------------------------------------------
+  // Company (job-work) logins — one password per company, admin-managed.
+  // ---------------------------------------------------------------
+  function renderCompanyAccessList() {
+    const list = $("#company-access-list");
+    if (!list) return;
+    const hashes = (state.access && state.access.companyHashes) || {};
+    const passwords = (state.access && state.access.companyPasswords) || {};
+    list.innerHTML = "";
+    if (!state.jobworkCompanies.length) {
+      list.appendChild(el("li", { class: "empty-hint" }, ["No job work companies yet."]));
+      return;
+    }
+    state.jobworkCompanies.forEach((c) => {
+      const parts = [c.name + " — ", el("strong", {}, [hashes[c.id] ? "login active" : "no login yet"])];
+      if (hashes[c.id]) {
+        parts.push(" · Password: ");
+        parts.push(passwords[c.id]
+          ? el("code", { style: "font-weight:700; padding:1px 6px; border-radius:6px; background:var(--surface-2); user-select:all;" }, [passwords[c.id]])
+          : el("em", {}, ["set before passwords were shown — save it again to display it here"]));
+      }
+      list.appendChild(el("li", {}, parts));
+    });
+  }
+
+  async function saveCompanyPassword(remove) {
+    const companyId = $("#s-company-access-company").value;
+    const company = jobCompanyById(companyId);
+    if (!company) return toast("Pick a company first.", "error");
+    const pw = ($("#s-company-access-password").value || "").trim();
+    const payload = Object.assign({}, state.access);
+    payload.companyHashes = Object.assign({}, state.access.companyHashes || {});
+    payload.companyPasswords = Object.assign({}, state.access.companyPasswords || {});
+    if (remove) {
+      if (!payload.companyHashes[companyId]) return toast(company.name + " has no login to remove.", "warn");
+      if (!confirm("Remove " + company.name + "'s login? Anyone using it will be signed out.")) return;
+      delete payload.companyHashes[companyId];
+      delete payload.companyPasswords[companyId];
+    } else {
+      if (pw.length < 6) return toast("Use a password of at least 6 characters.", "error");
+      const hash = await sha256Hex(pw);
+      const clash = hash === payload.adminHash || hash === payload.teamHash ||
+        Object.keys(payload.companyHashes).some((id) => id !== companyId && payload.companyHashes[id] === hash);
+      if (clash) return toast("That password is already used by another login — pick a different one.", "error");
+      payload.companyHashes[companyId] = hash;
+      payload.companyPasswords[companyId] = pw;
+    }
+    try {
+      if (state.db) await state.db.doc("settings/access").set(payload);
+      state.access = payload;
+      $("#s-company-access-password").value = "";
+      renderCompanyAccessList();
+      toast(remove
+        ? company.name + "'s login removed."
+        : company.name + " login saved. Send them the app link and this password — they'll see only their own stock.", "success");
+    } catch (e) {
+      toast("Could not save: " + e.message, "error");
+    }
+  }
+
+  // ---------------------------------------------------------------
   // Wire up static DOM events (once)
   // ---------------------------------------------------------------
   function wireEvents() {
@@ -2767,11 +3398,19 @@
     $("#lock-password").addEventListener("keydown", (e) => { if (e.key === "Enter") attemptUnlock(); });
     $("#btn-logout").addEventListener("click", lockApp);
     $("#btn-save-access").addEventListener("click", saveAccessPasswords);
+    if ($("#btn-save-company-access")) $("#btn-save-company-access").addEventListener("click", () => saveCompanyPassword(false));
+    if ($("#btn-remove-company-access")) $("#btn-remove-company-access").addEventListener("click", () => saveCompanyPassword(true));
 
     $all(".tab-btn").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
     $("#f-date").value = todayStr();
     $("#f-date").addEventListener("change", renderTodayList);
+    if ($("#f-factory")) {
+      let lastFactory = "";
+      try { lastFactory = localStorage.getItem("bb_last_factory") || ""; } catch (e) { /* ignore */ }
+      if (FACTORIES.indexOf(lastFactory) !== -1) $("#f-factory").value = lastFactory;
+      $("#f-factory").addEventListener("change", () => { toggleDayLabourUI(); updateLiveSummary(); });
+    }
     $("#f-date").addEventListener("change", () => {
       if ($("#f-use-daylabour") && $("#f-use-daylabour").checked) toggleDayLabourUI();
     });
@@ -2940,14 +3579,13 @@
 
     // Processing cost breakdown — live readout as the user types, before saving.
     $("#btn-save-processing-breakdown").addEventListener("click", saveProcessingBreakdown);
+    if ($("#btn-float-save")) $("#btn-float-save").addEventListener("click", saveFloatingManual);
+    if ($("#btn-float-recalc")) $("#btn-float-recalc").addEventListener("click", () => recalcAllClosedMonths(true));
     [
       "#s-eb-cost", "#s-fuel-cost", "#s-maintenance-cost", "#s-electrical-maintenance-cost",
       "#s-stitching-expense", "#s-sack-expenses", "#s-department-expenses", "#s-staff-salaries",
-      "#s-budgeted-output-mt", "#s-use-actual-output",
+      "#s-budgeted-output-mt",
     ].forEach((sel) => $(sel).addEventListener("input", updateProcessingBreakdownReadout));
-    $("#s-proc-month").addEventListener("change", loadBreakdownMonth);
-    $("#btn-copy-prev-month").addEventListener("click", copyPreviousMonthBreakdown);
-    $("#btn-delete-proc-month").addEventListener("click", deleteBreakdownMonth);
 
     // Job Work — company / product management (admin only)
     if ($("#jw-btn-show-add-company")) {
@@ -3023,6 +3661,126 @@
     }
   }
 
+  // ---------- Attendance tab ----------
+  function attMonthLabel(m) { return new Date(m + "-01T00:00:00").toLocaleDateString("en-IN", { month: "short", year: "numeric" }); }
+  function renderAttendance() {
+    if (!$("#view-attendance")) return;
+    // entry form: show what's saved for the picked date / factory
+    const d = $("#att-date") ? $("#att-date").value : "";
+    const f = $("#att-factory") ? $("#att-factory").value : "";
+    if (d && f && document.activeElement !== $("#att-operators") && document.activeElement !== $("#att-loadmen")) {
+      const a = attendanceFor(d, f);
+      $("#att-operators").value = a ? a.operators : "";
+      $("#att-loadmen").value = a ? a.loadmen : "";
+      $("#att-status").textContent = a ? "Saved for " + f + " on " + d + "." : "Not entered yet for " + f + " on " + d + ".";
+    }
+    // month selector
+    const ms = $("#att-month");
+    const monthsSet = new Set();
+    Object.values(state.attendance).forEach((a) => { if (a.date) monthsSet.add(monthOf(a.date)); });
+    state.entries.forEach((e) => monthsSet.add(monthOf(e.date)));
+    monthsSet.add(todayStr().slice(0, 7));
+    const months = Array.from(monthsSet).filter((m) => /^\d{4}-\d{2}$/.test(m)).sort().reverse();
+    if (ms) {
+      const keep = ms.value;
+      ms.innerHTML = months.map((m) => '<option value="' + m + '">' + attMonthLabel(m) + '</option>').join("");
+      ms.value = keep && months.indexOf(keep) !== -1 ? keep : months[0];
+    }
+    const m = ms ? ms.value : todayStr().slice(0, 7);
+    const fs = state.viewFactory ? [state.viewFactory] : FACTORIES.slice();
+    // register
+    const [yy, mm] = m.split("-").map(Number);
+    const daysIn = new Date(yy, mm, 0).getDate();
+    let html = '<div class="table-wrap max-scroll"><table><thead><tr><th>Date</th>' + fs.map((f) => '<th class="num">' + f + ' operators</th><th class="num">' + f + ' loadmen</th><th class="num">' + f + ' output (MT)</th>').join("") + '</tr></thead><tbody>';
+    const tot = {};
+    fs.forEach((f) => { tot[f] = { op: 0, ld: 0, kg: 0, days: 0, missing: 0 }; });
+    for (let day = daysIn; day >= 1; day--) {
+      const date = m + "-" + String(day).padStart(2, "0");
+      if (date > todayStr()) continue;
+      let cells = "", any = false;
+      fs.forEach((f) => {
+        const a = attendanceFor(date, f);
+        const kg = state.entries.filter((e) => e.date === date && factoryOf(e) === f).reduce((x, e) => x + (Number(e.outputQty) || 0), 0);
+        if (a) { tot[f].op += a.operators; tot[f].ld += a.loadmen; tot[f].days++; any = true; }
+        if (kg) { tot[f].kg += kg; any = true; }
+        const miss = kg > 0 && !a;
+        if (miss) tot[f].missing++;
+        cells += '<td class="num">' + (a ? a.operators : (miss ? '<span style="color:var(--critical);font-weight:700;">missing</span>' : "—")) + '</td><td class="num">' + (a ? a.loadmen : (miss ? '<span style="color:var(--critical);font-weight:700;">missing</span>' : "—")) + '</td><td class="num">' + (kg ? fmtNum(kg / KG_PER_MT, 1) : "—") + '</td>';
+      });
+      if (any) html += '<tr><td>' + date + '</td>' + cells + '</tr>';
+    }
+    html += '<tr style="font-weight:800;"><td>Total</td>' + fs.map((f) => '<td class="num">' + tot[f].op + '</td><td class="num">' + tot[f].ld + '</td><td class="num">' + fmtNum(tot[f].kg / KG_PER_MT, 1) + '</td>').join("") + '</tr></tbody></table></div>';
+    const missing = fs.reduce((a, f) => a + tot[f].missing, 0);
+    if (missing) html = '<p class="factory-note">' + missing + ' day' + (missing === 1 ? " has" : "s have") + ' production logged but no attendance. Enter it above so wages are shared correctly.</p>' + html;
+    if ($("#att-register")) $("#att-register").innerHTML = html;
+
+    // salary sheet check + month-end rate (admin only)
+    const card = $("#att-salary-card");
+    if (card) card.hidden = state.role !== "admin";
+    if (state.role !== "admin") return;
+    const money = (v) => "₹" + Math.round(v || 0).toLocaleString("en-IN");
+    let h2 = '<div class="table-wrap"><table><thead><tr><th>Factory</th><th class="num">Days with attendance</th><th class="num">Operator man-days</th><th class="num">Loadman man-days</th><th class="num">Salary sheet — operators</th><th class="num">Salary sheet — loadmen</th><th class="num">At daily wage rate</th><th class="num">Difference</th><th class="num">Wages per man-day</th><th class="num">Wages per MT</th></tr></thead><tbody>';
+    FACTORIES.forEach((f) => {
+      const t = { op: 0, ld: 0, days: 0, kg: 0 };
+      Object.values(state.attendance).forEach((a) => { if (monthOf(a.date) === m && (a.factory || "Plant") === f) { t.op += Number(a.operators) || 0; t.ld += Number(a.loadmen) || 0; t.days++; } });
+      state.entries.forEach((e) => { if (monthOf(e.date) === m && factoryOf(e) === f) t.kg += Number(e.outputQty) || 0; });
+      const sh = salarySheetFor(m, f), r = wageRatesFor(f);
+      const sheet = sh.opAmt + sh.loadAmt, atRate = t.op * r.op + t.ld * r.ld, md = t.op + t.ld;
+      h2 += '<tr><td>' + f + '</td><td class="num">' + t.days + '</td><td class="num">' + t.op + '</td><td class="num">' + t.ld + '</td>' +
+        '<td class="num">' + (sh.opAmt ? money(sh.opAmt) + (sh.opHead ? ' <span class="hint">(' + sh.opHead + ')</span>' : '') : '<span class="hint">not entered</span>') + '</td>' +
+        '<td class="num">' + (sh.loadAmt ? money(sh.loadAmt) + (sh.loadHead ? ' <span class="hint">(' + sh.loadHead + ')</span>' : '') : '<span class="hint">not entered</span>') + '</td>' +
+        '<td class="num">' + money(atRate) + '</td><td class="num"><strong>' + (sheet ? (sheet - atRate >= 0 ? "+" : "−") + money(Math.abs(sheet - atRate)).slice(0) : "—") + '</strong></td>' +
+        '<td class="num">' + (sheet && md ? money(sheet / md) : "—") + '</td><td class="num">' + (sheet && t.kg ? money(sheet / (t.kg / KG_PER_MT)) : "—") + '</td></tr>';
+    });
+    h2 += '</tbody></table></div>';
+    // common staff salaries
+    let staff = 0;
+    state.trackerExpenses.forEach((d) => { if (monthOf(d.date) === m && d.category === "Salaries & Wages" && !isWageLine(d)) staff += Number(d.amount) || 0; });
+    const kgF = {}; let kgT = 0;
+    FACTORIES.forEach((f) => { kgF[f] = state.entries.filter((e) => monthOf(e.date) === m && factoryOf(e) === f).reduce((x, e) => x + (Number(e.outputQty) || 0), 0); kgT += kgF[f]; });
+    h2 += '<div class="card-title" style="margin-top:18px;">Staff salaries</div><div class="table-wrap"><table><thead><tr><th>Factory</th><th class="num">Output (MT)</th><th class="num">Share</th><th class="num">Staff salary charged</th><th class="num">Per MT</th></tr></thead><tbody>';
+    FACTORIES.forEach((f) => {
+      const sh = kgT ? kgF[f] / kgT : 0;
+      h2 += '<tr><td>' + f + '</td><td class="num">' + fmtNum(kgF[f] / KG_PER_MT, 1) + '</td><td class="num">' + (sh * 100).toFixed(1) + '%</td><td class="num">' + (staff ? money(staff * sh) : "—") + '</td><td class="num">' + (staff && kgT ? money(staff / (kgT / KG_PER_MT)) : "—") + '</td></tr>';
+    });
+    h2 += '<tr style="font-weight:800;"><td>Total</td><td class="num">' + fmtNum(kgT / KG_PER_MT, 1) + '</td><td class="num">100%</td><td class="num">' + (staff ? money(staff) : '<span class="hint">salary sheet not entered</span>') + '</td><td></td></tr></tbody></table></div>';
+    if ($("#att-salary")) $("#att-salary").innerHTML = h2;
+  }
+  async function saveAttendance() {
+    const d = $("#att-date").value, f = $("#att-factory").value;
+    const op = $("#att-operators").value.trim(), ld = $("#att-loadmen").value.trim();
+    if (!d || !f) return toast("Pick the date and factory.", "error");
+    if (op === "" || ld === "") return toast("Enter both operators and loadmen present (0 if none).", "error");
+    try {
+      await saveDayLabour(d, parseFloat(op) || 0, parseFloat(ld) || 0, f);
+      await recomputeDayLabourSplit(d, f);
+      if (isClosedMonth(monthOf(d))) await recalcMonthProcessing(monthOf(d));
+      toast("Attendance saved for " + f + " on " + d + ".", "success");
+      renderAttendance();
+    } catch (e) { toast("Could not save attendance: " + e.message, "error"); }
+  }
+
+  function setViewFactory(f, silent) {
+    state.viewFactory = FACTORIES.indexOf(f) !== -1 ? f : "";
+    stockScope = state.viewFactory;
+    try { localStorage.setItem("bbViewFactory", state.viewFactory); } catch (e) { /* ignore */ }
+    $all(".factory-switch button").forEach((b) => b.classList.toggle("active", b.dataset.factory === state.viewFactory));
+    document.documentElement.setAttribute("data-factory", state.viewFactory || "both");
+    $all(".factory-view-select").forEach((sel) => { sel.value = state.viewFactory; });
+    if (state.viewFactory && $("#st-factory")) $("#st-factory").value = state.viewFactory;
+    // New batches default to the factory being viewed.
+    if (state.viewFactory && $("#f-factory") && !state.editingEntryId) $("#f-factory").value = state.viewFactory;
+    if ($("#att-factory") && state.viewFactory) $("#att-factory").value = state.viewFactory;
+    if (!silent) {
+      renderAttendance();
+      renderTodayList();
+      renderReports();
+      renderStock();
+      renderJobPnL();
+      if (typeof stockAutofillOpening === "function" && $("#st-product") && $("#st-product").value) stockAutofillOpening();
+    }
+  }
+
   function renderAll() {
     rebuildMaterialGrid();
     populateProductSelects();
@@ -3036,18 +3794,62 @@
     populateJobCompanySelect();
     renderJobCompanies();
     renderJobPnL();
+    renderAttendance();
+    if ($("#f-use-daylabour") && $("#f-use-daylabour").checked) toggleDayLabourUI();
   }
 
   document.addEventListener("DOMContentLoaded", function () {
+    const vs = $("#btn-view-size");
+    if (vs) {
+      const label = () => { vs.textContent = document.documentElement.getAttribute("data-view") === "compact" ? "Normal size" : "Compact size"; };
+      label();
+      vs.addEventListener("click", () => {
+        const next = document.documentElement.getAttribute("data-view") === "compact" ? "normal" : "compact";
+        document.documentElement.setAttribute("data-view", next);
+        try { localStorage.setItem("bbView", next); } catch (e) { /* ignore */ }
+        label();
+      });
+    }
+    $all(".settings-nav-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        $all(".settings-nav-btn").forEach((b) => b.classList.toggle("active", b === btn));
+        $all(".settings-pane").forEach((p) => p.classList.toggle("active", p.id === "settings-pane-" + btn.dataset.pane));
+        try { localStorage.setItem("bbSettingsPane", btn.dataset.pane); } catch (e) { /* ignore */ }
+      });
+    });
+    try {
+      const pane = localStorage.getItem("bbSettingsPane");
+      const b = pane && document.querySelector('.settings-nav-btn[data-pane="' + pane + '"]');
+      if (b) b.click();
+    } catch (e) { /* ignore */ }
+    $all(".factory-switch button").forEach((b) => b.addEventListener("click", () => setViewFactory(b.dataset.factory)));
+    $all(".factory-view-select").forEach((sel) => sel.addEventListener("change", () => setViewFactory(sel.value)));
+    if ($("#st-factory")) $("#st-factory").addEventListener("change", stockAutofillOpening);
+    if ($("#att-date")) { $("#att-date").value = todayStr(); $("#att-date").addEventListener("change", renderAttendance); }
+    if ($("#att-factory")) $("#att-factory").addEventListener("change", renderAttendance);
+    if ($("#att-month")) $("#att-month").addEventListener("change", renderAttendance);
+    if ($("#btn-att-save")) $("#btn-att-save").addEventListener("click", saveAttendance);
+    if ($("#st-count")) $("#st-count").addEventListener("input", updateStockClosingPreview);
+    if ($("#xf-item")) $("#xf-item").addEventListener("change", toggleXferOther);
+    if ($("#btn-xfer-save")) $("#btn-xfer-save").addEventListener("click", submitTransfer);
+    if ($("#xf-date")) $("#xf-date").value = todayStr();
+    let savedFactory = "";
+    try { savedFactory = localStorage.getItem("bbViewFactory") || ""; } catch (e) { /* ignore */ }
     wireEvents();
+    setViewFactory(savedFactory, true);
     renderAll();
     initDb();
 
     // Already unlocked earlier this browser tab session? Skip the gate.
     let savedRole = null;
     try { savedRole = sessionStorage.getItem(ROLE_STORAGE_KEY); } catch (e) { /* ignore */ }
-    if (savedRole === "admin" || savedRole === "team") {
+    const trackerRole = trackerEmbedRole();
+    if (trackerRole) {
+      applyRole(trackerRole);
+    } else if (savedRole === "admin" || savedRole === "team") {
       applyRole(savedRole);
+    } else if (savedRole && savedRole.indexOf(COMPANY_ROLE_PREFIX) === 0) {
+      applyRole("company", savedRole.slice(COMPANY_ROLE_PREFIX.length));
     } else {
       $("#lock-password").focus();
     }
