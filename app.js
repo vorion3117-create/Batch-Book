@@ -122,15 +122,25 @@
     return processingCostPerMT(state.labour);
   }
 
+  // The processing cost a batch should carry right now: its product's own
+  // fixed cost if it has one, else its month's ₹/MT rate × its own MT
+  // output, else the flat per-batch fallback.
+  function expectedProcessingCost(e) {
+    const override = productProcessingCostOverride(e.productId);
+    if (override != null) return override;
+    const rate = processingRateForDate(e.date);
+    return rate != null ? rate * ((Number(e.outputQty) || 0) / KG_PER_MT) : (Number(state.labour.processingCost) || 0);
+  }
+
   // Rewrites processingCost/totalCost/costPerKg (and jobworkProfit) on every
-  // batch in a month so stored figures follow that month's latest rate.
+  // batch whose stored figure no longer matches the current breakdown, so
+  // stored figures always follow the latest monthly rate. Pass a month
+  // ("YYYY-MM") to limit it to that month, or nothing for every month.
   async function recomputeMonthProcessing(month) {
-    if (!month) return;
-    const rows = state.entries.filter((e) => monthKeyOf(e.date) === month && productProcessingCostOverride(e.productId) == null);
-    const rate = processingRateForDate(month + "-01");
+    const rows = state.entries.filter((e) => e.date && (!month || monthKeyOf(e.date) === month));
     const updates = [];
     rows.forEach((e) => {
-      const proc = rate != null ? rate * ((Number(e.outputQty) || 0) / KG_PER_MT) : (Number(state.labour.processingCost) || 0);
+      const proc = expectedProcessingCost(e);
       if (Math.abs(proc - (Number(e.processingCost) || 0)) < 0.005) return;
       const totalCost = (Number(e.rmCost) || 0) + proc + (Number(e.labourCost) || 0);
       const fields = { processingCost: proc, totalCost, costPerKg: e.outputQty > 0 ? totalCost / e.outputQty : 0 };
@@ -155,6 +165,26 @@
       renderReports();
     }
     return updates.length;
+  }
+
+  // Automatic re-costing: whenever batches, the monthly breakdown or
+  // product costs change (on this device or another), bring every batch
+  // in line with its month's current rate. Debounced so a burst of
+  // changes causes one pass; writes only what actually differs, so it
+  // settles after one round.
+  let reconcileTimer = null, reconcileRunning = false;
+  function scheduleProcessingReconcile() {
+    if (!state.role) return; // only once someone has logged in
+    clearTimeout(reconcileTimer);
+    reconcileTimer = setTimeout(async () => {
+      if (reconcileRunning) return scheduleProcessingReconcile();
+      reconcileRunning = true;
+      try {
+        const n = await recomputeMonthProcessing();
+        if (n) { renderReports(); renderMonthlyProcessingHistory(); }
+      } catch (e) { /* next change retries */ }
+      reconcileRunning = false;
+    }, 1500);
   }
 
   // Units offered everywhere a material or product's unit is picked.
@@ -781,6 +811,7 @@
         populateProductSelects();
         renderJobCompanies();
         renderJobPnL();
+        scheduleProcessingReconcile();
       },
       () => {}
     );
@@ -823,6 +854,7 @@
         }
         renderSettingsLabour();
         updateLiveSummary();
+        scheduleProcessingReconcile();
       },
       () => {}
     );
@@ -851,6 +883,7 @@
         renderJobPnL();
         updateProcessingBreakdownReadout();
         renderMonthlyProcessingHistory();
+        scheduleProcessingReconcile();
       },
       (e) => { toast("Sync error loading entries: " + e.message, "error"); }
     );
@@ -918,6 +951,7 @@
   // Settings (rates, wages, access control) stays admin-only.
   function applyRole(role) {
     state.role = role;
+    scheduleProcessingReconcile();
     $("#lock-screen").hidden = true;
     $("#app").hidden = false;
 
@@ -1061,6 +1095,7 @@
           : "Fallback processing cost for \"" + product.name + "\" set to " + fmtINR(updated.processingCost) + ".",
         "success"
       );
+      scheduleProcessingReconcile();
     } catch (e) {
       toast("Could not save: " + e.message, "error");
     }
@@ -2650,6 +2685,7 @@
       if (state.db) await state.db.doc("settings/labour").set(payload);
       toast("Labour & processing settings saved.", "success");
       updateLiveSummary();
+      scheduleProcessingReconcile();
     } catch (e) {
       toast("Could not save settings: " + e.message, "error");
     }
